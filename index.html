@@ -1,0 +1,3802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Ledger — personal budgeting</title>
+<meta name="theme-color" content="#1C2B3A" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont/dist/tabler-icons.min.css" />
+<style>
+  html, body { margin: 0; padding: 0; background: #F7F4EC; }
+  * { box-sizing: border-box; }
+  #root { min-height: 100vh; }
+  input, select, button { font-size: 16px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" onerror="window.__loadFailed=true"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" onerror="window.__loadFailed=true"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js" onerror="window.__loadFailed=true"></script>
+
+<script>
+  function showLoadError(detail) {
+    var root = document.getElementById('root');
+    if (root && !root.innerHTML) {
+      root.innerHTML =
+        '<div style="padding:24px;font-family:sans-serif;color:#8A3C28;max-width:560px;margin:40px auto;">' +
+        '<h3>Something went wrong loading this page</h3>' +
+        (detail
+          ? '<p style="font-family:monospace;font-size:13px;background:#F3E3DC;padding:10px;border-radius:6px;">' + detail + '</p>'
+          : '') +
+        '<p>If this mentions a missing script or network error, check your internet connection and reload. ' +
+        'If it mentions a syntax or code error, that is a bug in the app itself and reloading will not help.</p>' +
+        '</div>';
+    }
+  }
+  window.addEventListener('error', function (e) {
+    showLoadError(e.message || (e.error && e.error.message) || 'Unknown error');
+  });
+  // fallback check in case nothing has rendered after a few seconds (e.g. a script
+  // silently failed to load rather than throwing a catchable error)
+  setTimeout(function () {
+    if (window.__loadFailed || typeof React === 'undefined' || typeof ReactDOM === 'undefined' || typeof Babel === 'undefined') {
+      showLoadError('A required script (React, ReactDOM, or Babel) did not load. Check your internet connection.');
+    }
+  }, 6000);
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useMemo } = React;
+
+/* ---------- storage helpers ---------- */
+const STORE_KEY = "budget_app_state_v1";
+
+async function loadState() {
+  try {
+    const raw = window.localStorage.getItem(STORE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+async function saveState(state) {
+  try {
+    window.localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  } catch (e) {
+    console.error("save failed", e);
+  }
+}
+
+/* ---------- defaults ---------- */
+const DEFAULT_BILLS = [
+  { id: "b1", name: "Progressive insurance", amount: 85, day: 3, paid: false, paidMonthKey: null },
+  { id: "b2", name: "Boost mobile", amount: 27, day: 14, paid: false, paidMonthKey: null },
+  { id: "b3", name: "BeyondFinance", amount: 432.76, day: 18, paid: false, paidMonthKey: null },
+  { id: "b4", name: "Spotify", amount: 14.06, day: 20, paid: false, paidMonthKey: null },
+  { id: "b5", name: "VASA fitness", amount: 27.98, day: 20, paid: false, paidMonthKey: null },
+];
+
+const DEFAULT_BUDGETS = {
+  groceries: { label: "Groceries", monthly: 400 },
+  gas: { label: "Gas", monthly: 160 },
+  eatingOut: { label: "Eating out", monthly: 120 },
+};
+
+/* today's date as "YYYY-MM-DD" in LOCAL time — toISOString() always returns UTC,
+   which can report the wrong calendar day depending on timezone and time of day. */
+const todayISO = () => {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
+const monthKey = (d = new Date()) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+const daysInMonth = (d = new Date()) =>
+  new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+const dayOfMonth = (d = new Date()) => d.getDate();
+
+/* Parses a "YYYY-MM-DD" date-only string as LOCAL midnight, not UTC midnight.
+   new Date("2026-06-20") parses as UTC, which then displays as the previous day
+   in any timezone behind UTC (e.g. all of the US) — this avoids that off-by-one. */
+function parseLocalDate(dateStr) {
+  if (!dateStr) return new Date();
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+
+/* Formats a "YYYY-MM-DD" date-only string for display, using local-midnight parsing
+   so the displayed day always matches what was actually entered. */
+function formatLocalDate(dateStr) {
+  return parseLocalDate(dateStr).toLocaleDateString();
+}
+
+const fmt = (n) =>
+  (n < 0 ? "-$" : "$") +
+  Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function uid(prefix = "id") {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/* ---------- initial state ---------- */
+const initialState = {
+  bills: DEFAULT_BILLS,
+  budgets: DEFAULT_BUDGETS,
+  income: [], // { id, date, amount, type: 'regular'|'freelance', monthKey }
+  spending: [], // { id, date, category, amount, monthKey, tags: string[], description? }
+  goals: [], // { id, name, cost, hasDeadline, deadline, status: 'wishlist'|'active', weeklyOverride }
+  transfers: [], // { id, label, amount, target, done, createdAt, monthKey }
+  bailouts: [], // { id, fromBucket, toBucket, amount, reason, date, monthKey }
+  buckets: { savings: 0, tax: 0, slush: 0, stss: 0, bills: 0, checking: 0 },
+  alerts: {
+    paceAlertOn: true,
+    spendingPaceAlertOn: true,
+    billWinAlertOn: true,
+    weeklyProjectionAlertOn: true,
+    custom: [],
+  },
+  monthlyIncomeProjection: 3000,
+  invoices: [], // { id, description, amount, issueDate, status: 'unpaid'|'paid', paidDate, incomeId }
+  billPaidHistory: [], // { id, billId, billName, amount, monthKey, paidDate }
+  currentBillsMonthKey: null, // set on first load to this month's key
+  setupCompleted: false,
+  setupDraft: {
+    step: 0,
+    projection: 3000,
+    draftPaychecks: [],
+    draftInvoices: [],
+    draftBillsPaid: {},
+    draftSpending: [],
+    balances: { checking: 0, savings: 0, bills: 0, tax: 0, slush: 0, stss: 0 },
+  },
+  moneyDate: { enabled: false, dayOfWeek: 0, time: "18:00" }, // dayOfWeek: 0=Sun..6=Sat
+  lastWin: null, // { billName, id, at } — transient, cleared after the Dashboard shows it
+  shoppingList: [], // { id, name, checked }
+  knownLimitations: [
+    {
+      id: "lim_widget",
+      request: "A live Android home-screen widget showing the dashboard",
+      why: "Home-screen widgets are a native OS feature (Android's AppWidgetProvider). A web artifact runs in a sandboxed browser environment and has no path to the home screen — it can only become a tappable shortcut icon, not a live-updating tile.",
+      solution: "Build this as a real native Android app (Kotlin/Java, via Android Studio), using AppWidgetProvider for the widget and the app's own local database for data. That's a separate software project you'd build and install yourself — sideloaded as an APK or published to the Play Store.",
+    },
+    {
+      id: "lim_push",
+      request: "Real push notifications or text messages for alerts (money date, pace warnings, bill wins, weekly projection) even when the app is closed",
+      why: "This app has no access to Android's notification system, SMS, or any channel that reaches your phone outside of this chat. Browser notification APIs are blocked inside the artifact sandbox, and even outside it, they only work while a tab is open. I also have no scheduler or memory that runs between conversations, so I can't independently check the app later and message you.",
+      solution: "A native Android app (see above) using AlarmManager/WorkManager to schedule local notifications, or a small backend service using Firebase Cloud Messaging if you want notifications to sync across devices. Either path is a real build, not an extension of this artifact.",
+    },
+    {
+      id: "lim_sync",
+      request: "True cross-device sync between phone and computer, independent of which conversation or link the app was opened from",
+      why: "Artifact storage is tied to the specific artifact instance (this conversation, this account) — not to a portable app identity. Opening a downloaded copy of the code, a remix, or a fresh conversation creates entirely separate storage, even though the code is identical. Today, continuity only works if both devices open this exact same conversation's artifact.",
+      solution: "A real backend (e.g. a hosted database with user accounts, like Firebase, Supabase, or a custom API) that the app talks to over the network, instead of relying on artifact-local storage. That would let any device log into the same account and see the same data, regardless of which copy of the code it's running. This means turning the app into an actual deployed product with its own server, not just an artifact.",
+    },
+  ],
+};
+
+const REGULAR_INCOME_SAVINGS_FLAT = 50;
+
+/* ---------- core allocation engine ----------
+   Regular income: the $50 savings transfer happens BEFORE the paycheck hits checking.
+   So `entry.amount` for a regular paycheck is what actually lands in checking — the
+   true gross was amount + $50. The $50 is logged as a savings move, but it's not
+   subtracted from `amount` again since it already never touched checking.
+
+   Freelance income: no automatic pre-deduction. `entry.amount` is the full amount,
+   and we take 15% tax + 10% savings out of it in-app, same as before. */
+function allocateIncome(entry, state) {
+  const { amount, type } = entry;
+  let remaining = amount;
+  const moves = [];
+
+  if (type === "freelance") {
+    const tax = round2(amount * 0.15);
+    moves.push({ bucket: "tax", amount: tax, note: "Freelance tax set-aside (15%)" });
+    remaining -= tax;
+
+    const savings = round2(amount * 0.1);
+    moves.push({ bucket: "savings", amount: savings, note: "Automatic savings (10%)" });
+    remaining -= savings;
+  } else {
+    // regular income: $50 already pulled before checking, logged here for visibility
+    // but not subtracted from `remaining` since `amount` is already net of it
+    moves.push({
+      bucket: "savings",
+      amount: REGULAR_INCOME_SAVINGS_FLAT,
+      note: "Automatic savings ($50, pulled before checking)",
+      alreadyDeducted: true,
+    });
+  }
+
+  // remainder goes toward bills account first
+  const billsMove = round2(remaining);
+  moves.push({ bucket: "bills", amount: billsMove, note: "To bills account" });
+  remaining -= billsMove;
+
+  // after this, budgets (groceries/gas/eating out) are tracked separately as spending limits,
+  // not a literal transfer — so whatever's left after bills is the slush/STSS pool source.
+  // We treat "remaining" here as 0 since billsMove consumed it; the real slush split happens
+  // at the monthly level once bills+budgets are known. See computeMonthlySplit.
+
+  return moves;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+/* parses a raw comma-separated tag string into a clean array,
+   trimming whitespace and dropping empty entries */
+function parseTags(raw) {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+/* marks a bill paid for the current month, logging it to paid history.
+   also handles rolling bills over to unpaid if we've crossed into a new month
+   since they were last touched. */
+function rolloverBillsIfNewMonth(state) {
+  const mKey = monthKey();
+  if (state.currentBillsMonthKey === mKey) return state;
+  // new month: reset all bills to unpaid, keep history as-is
+  return {
+    ...state,
+    bills: state.bills.map((b) => ({ ...b, paid: false, paidMonthKey: null })),
+    currentBillsMonthKey: mKey,
+  };
+}
+
+function markBillPaid(state, billId) {
+  const mKey = monthKey();
+  const bill = state.bills.find((b) => b.id === billId);
+  if (!bill) return state;
+
+  const nowPaid = !bill.paid;
+  const newBills = state.bills.map((b) =>
+    b.id === billId ? { ...b, paid: nowPaid, paidMonthKey: nowPaid ? mKey : null } : b
+  );
+
+  let newHistory = state.billPaidHistory;
+  let lastWin = state.lastWin || null;
+  if (nowPaid) {
+    newHistory = [
+      ...state.billPaidHistory,
+      {
+        id: uid("paid"),
+        billId: bill.id,
+        billName: bill.name,
+        amount: bill.amount,
+        monthKey: mKey,
+        paidDate: todayISO(),
+      },
+    ];
+    // a "win" — paid on or before its due day this month — surfaces a one-time
+    // celebratory banner on the Dashboard, cleared after it's been shown
+    if (bill.day >= dayOfMonth()) {
+      lastWin = { billName: bill.name, id: uid("win"), at: Date.now() };
+    }
+  } else {
+    // unchecking — remove the most recent matching history entry for this bill/month
+    const idx = newHistory
+      .map((h, i) => (h.billId === billId && h.monthKey === mKey ? i : -1))
+      .filter((i) => i >= 0)
+      .pop();
+    if (idx != null) newHistory = newHistory.filter((_, i) => i !== idx);
+  }
+
+  return { ...state, bills: newBills, billPaidHistory: newHistory, lastWin };
+}
+
+/* converts a paid invoice into a freelance income entry, dated today,
+   while preserving the invoice's original issue date for reporting */
+function convertInvoiceToIncome(state, invoiceId) {
+  const invoice = state.invoices.find((i) => i.id === invoiceId);
+  if (!invoice || invoice.status === "paid") return state;
+
+  const incomeEntry = {
+    id: uid("inc"),
+    date: todayISO(),
+    amount: round2(invoice.amount),
+    type: "freelance",
+    monthKey: monthKey(),
+    fromInvoiceId: invoice.id,
+  };
+
+  const moves = allocateIncome(incomeEntry, state);
+  const newBuckets = { ...state.buckets };
+  const newTransfers = [...state.transfers];
+
+  moves.forEach((m) => {
+    newBuckets[m.bucket] = round2((newBuckets[m.bucket] || 0) + m.amount);
+    newTransfers.push({
+      id: uid("xfer"),
+      fromAccount: "Checking",
+      toAccount: ACCOUNT_DISPLAY_NAMES[m.bucket] || m.bucket,
+      amount: m.amount,
+      note: `${m.note} — invoice: ${invoice.description}`,
+      target: m.bucket,
+      done: !!m.alreadyDeducted,
+      createdAt: incomeEntry.date,
+      monthKey: incomeEntry.monthKey,
+    });
+  });
+
+  const tempState = { ...state, income: [...state.income, incomeEntry] };
+  const split = computeMonthlySplit(tempState, incomeEntry.monthKey);
+  newBuckets.slush = split.slushAdd;
+  newBuckets.stss = split.stssAdd;
+
+  const newInvoices = state.invoices.map((i) =>
+    i.id === invoiceId
+      ? { ...i, status: "paid", paidDate: incomeEntry.date, incomeId: incomeEntry.id }
+      : i
+  );
+
+  return {
+    ...state,
+    income: [...state.income, incomeEntry],
+    invoices: newInvoices,
+    buckets: newBuckets,
+    transfers: newTransfers,
+  };
+}
+
+/* computes, for a given month, the leftover after bills+budgets are covered by income so far,
+   and splits that leftover 50/50 into slush and stss.
+   totalBills here is the full month's bill load (for planning purposes), while
+   paidBillsTotal tracks what's actually been paid so far this cycle. */
+function computeMonthlySplit(state, mKey) {
+  const incomeThisMonth = state.income.filter((i) => i.monthKey === mKey);
+  const totalIncome = incomeThisMonth.reduce((s, i) => s + i.amount, 0);
+
+  const freelanceTax = incomeThisMonth
+    .filter((i) => i.type === "freelance")
+    .reduce((s, i) => s + round2(i.amount * 0.15), 0);
+
+  // regular income's $50 savings is pulled before checking, so `amount` (what's logged)
+  // is already net of it — don't subtract it again here. Only freelance's 10% actually
+  // comes out of the logged amount.
+  const freelanceSavingsCut = incomeThisMonth
+    .filter((i) => i.type === "freelance")
+    .reduce((s, i) => s + round2(i.amount * 0.1), 0);
+  const regularSavingsLogged = incomeThisMonth
+    .filter((i) => i.type === "regular")
+    .reduce((s) => s + REGULAR_INCOME_SAVINGS_FLAT, 0);
+  const savingsCut = freelanceSavingsCut; // only this portion reduces checking-bound money
+
+  const totalBills = state.bills.reduce((s, b) => s + b.amount, 0);
+  const paidBillsTotal = state.bills
+    .filter((b) => b.paid && b.paidMonthKey === mKey)
+    .reduce((s, b) => s + b.amount, 0);
+  const totalBudgets = Object.values(state.budgets).reduce((s, b) => s + b.monthly, 0);
+
+  const afterTaxSavings = totalIncome - freelanceTax - savingsCut;
+  const leftover = afterTaxSavings - totalBills - totalBudgets;
+  const usable = Math.max(0, leftover);
+
+  return {
+    totalIncome,
+    freelanceTax,
+    savingsCut, // freelance-only, for "money that left checking" math
+    savingsLoggedTotal: round2(savingsCut + regularSavingsLogged), // for display: all savings, incl. pre-checking $50s
+    totalBills,
+    paidBillsTotal,
+    unpaidBillsTotal: round2(totalBills - paidBillsTotal),
+    totalBudgets,
+    leftover,
+    slushAdd: round2(usable / 2),
+    stssAdd: round2(usable / 2),
+  };
+}
+
+/* ---------- alert engine ---------- */
+function checkPaceAlert(state) {
+  const mKey = monthKey();
+  const today = dayOfMonth();
+  const totalDays = daysInMonth();
+  const pace = today / totalDays;
+
+  const incomeThisMonth = state.income
+    .filter((i) => i.monthKey === mKey)
+    .reduce((s, i) => s + i.amount, 0);
+
+  const expectedByNow = round2(state.monthlyIncomeProjection * pace);
+
+  const totalBillsBudgets =
+    state.bills.reduce((s, b) => s + b.amount, 0) +
+    Object.values(state.budgets).reduce((s, b) => s + b.monthly, 0);
+
+  // only bills that are both past due AND actually marked paid count against "needed so far" —
+  // unpaid bills still show for planning but haven't actually left the account yet
+  const paidDueSoFar = state.bills
+    .filter((b) => b.day <= today && b.paid && b.paidMonthKey === mKey)
+    .reduce((s, b) => s + b.amount, 0);
+  // pro-rate budgets due-so-far by pace too
+  const budgetsDueSoFar = round2(
+    Object.values(state.budgets).reduce((s, b) => s + b.monthly, 0) * pace
+  );
+  const neededSoFar = paidDueSoFar + budgetsDueSoFar;
+
+  const behindPace = incomeThisMonth < expectedByNow;
+  const behindNeed = incomeThisMonth < neededSoFar;
+
+  return {
+    fires: state.alerts.paceAlertOn && (behindPace || behindNeed) ? true : false,
+    incomeThisMonth,
+    expectedByNow,
+    neededSoFar,
+    behindPace,
+    behindNeed,
+    totalBillsBudgets,
+  };
+}
+
+/* checks whether the next occurrence of the weekly money date falls within the
+   next 30 minutes from now, so a heads-up banner can show in the app. */
+function checkMoneyDateAlert(state) {
+  const md = state.moneyDate;
+  if (!md || !md.enabled) return { fires: false };
+
+  const now = new Date();
+  const [h, m] = (md.time || "18:00").split(":").map(Number);
+
+  // find the next occurrence of the target day/time, today or up to 7 days out
+  for (let offset = 0; offset <= 7; offset++) {
+    const candidate = new Date(now);
+    candidate.setDate(now.getDate() + offset);
+    candidate.setHours(h, m, 0, 0);
+    if (candidate.getDay() !== md.dayOfWeek) continue;
+    const diffMs = candidate - now;
+    const diffMin = diffMs / 60000;
+    if (diffMin >= 0 && diffMin <= 30) {
+      return { fires: true, eventTime: candidate };
+    }
+    break; // first matching day found and it's not in the alert window — stop looking
+  }
+  return { fires: false };
+}
+
+/* per-category spending pace, reusable wherever "ahead of pace" needs checking
+   (Budgets cards already compute this inline; this is the shared version used
+   for the Alerts tab and Dashboard banner). */
+function checkSpendingPaceAlerts(state) {
+  const mKey = monthKey();
+  const today = dayOfMonth();
+  const totalDays = daysInMonth();
+  const pace = today / totalDays;
+
+  return Object.entries(state.budgets)
+    .map(([key, b]) => {
+      const spent = state.spending
+        .filter((sp) => sp.category === key && sp.monthKey === mKey)
+        .reduce((s, sp) => s + sp.amount, 0);
+      const expectedByNow = round2(b.monthly * pace);
+      return { key, label: b.label, spent, expectedByNow, over: spent > expectedByNow + 0.01 };
+    })
+    .filter((c) => c.over);
+}
+
+/* builds the weekly projection digest: bills due in the next 7 days and a rough
+   read on available funds (checking minus what's still owed against it this week). */
+function buildWeeklyProjection(state) {
+  const today = dayOfMonth();
+  const totalDays = daysInMonth();
+  const upcoming = state.bills
+    .filter((b) => b.day >= today && b.day <= Math.min(today + 7, totalDays) && !b.paid)
+    .sort((a, b) => a.day - b.day);
+  const upcomingTotal = upcoming.reduce((s, b) => s + b.amount, 0);
+  const availableFunds = round2((state.buckets.checking || 0) - upcomingTotal);
+
+  return { upcoming, upcomingTotal, availableFunds };
+}
+
+/* ---------- UI primitives ---------- */
+const Ledger = ({ children }) => (
+  <div style={{ display: "flex", flexDirection: "column" }}>{children}</div>
+);
+
+/* a small inline-editable currency amount — click to switch to a number input,
+   Enter or blur to save, Escape to cancel. Used for things like bill amounts
+   that fluctuate slightly month to month. */
+const EditableAmount = ({ value, onChange, tone, strikethrough }) => {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+
+  function commit() {
+    const v = parseFloat(draft);
+    if (!isNaN(v) && v >= 0) onChange(Math.round(v * 100) / 100);
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <Input
+        type="number"
+        value={draft}
+        autoFocus
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+          if (e.key === "Escape") setEditing(false);
+        }}
+        style={{ width: 80, fontSize: 13, padding: "4px 8px" }}
+      />
+    );
+  }
+
+  return (
+    <span
+      onClick={() => {
+        setDraft(value);
+        setEditing(true);
+      }}
+      title="Click to edit"
+      style={{
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: 14,
+        color: tone || "#1C2B3A",
+        textDecoration: strikethrough ? "line-through" : "none",
+        cursor: "pointer",
+        borderBottom: "1px dashed #C7BFA8",
+      }}
+    >
+      {fmt(value)}
+    </span>
+  );
+};
+
+/* a comma-separated tag input with a live auto-suggest dropdown. Matches against
+   whichever tag segment is currently being typed (the text after the last comma),
+   so picking a suggestion completes just that segment without disturbing tags
+   already typed before it. Click outside or Escape closes the dropdown. */
+const TagInput = ({ value, onChange, knownTags, placeholder, style }) => {
+  const [open, setOpen] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+
+  const segments = value.split(",");
+  const currentSegment = segments[segments.length - 1].trim().toLowerCase();
+  const alreadyUsed = segments.slice(0, -1).map((s) => s.trim().toLowerCase());
+
+  const suggestions =
+    currentSegment.length === 0
+      ? knownTags.filter((t) => !alreadyUsed.includes(t.toLowerCase())).slice(0, 6)
+      : knownTags
+          .filter(
+            (t) =>
+              t.toLowerCase().includes(currentSegment) &&
+              t.toLowerCase() !== currentSegment &&
+              !alreadyUsed.includes(t.toLowerCase())
+          )
+          .slice(0, 6);
+
+  function pickSuggestion(tag) {
+    const completed = [...segments.slice(0, -1).map((s) => s.trim()), tag].filter(Boolean);
+    onChange(completed.join(", ") + ", ");
+    setOpen(false);
+    setHighlight(0);
+  }
+
+  return (
+    <div style={{ position: "relative", ...style }}>
+      <Input
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+          setHighlight(0);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 120)}
+        onKeyDown={(e) => {
+          if (!open || suggestions.length === 0) return;
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setHighlight((h) => (h + 1) % suggestions.length);
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setHighlight((h) => (h - 1 + suggestions.length) % suggestions.length);
+          } else if (e.key === "Enter" || e.key === "Tab") {
+            if (suggestions[highlight]) {
+              e.preventDefault();
+              pickSuggestion(suggestions[highlight]);
+            }
+          } else if (e.key === "Escape") {
+            setOpen(false);
+          }
+        }}
+        style={{ width: "100%" }}
+      />
+      {open && suggestions.length > 0 && (
+        <div
+          style={{
+            position: "absolute",
+            top: "calc(100% + 4px)",
+            left: 0,
+            right: 0,
+            background: "#FFFEFB",
+            border: "1px solid #D8D2C2",
+            borderRadius: 6,
+            boxShadow: "0 0 0 1px rgba(0,0,0,0.02)",
+            zIndex: 20,
+            overflow: "hidden",
+          }}
+        >
+          {suggestions.map((tag, i) => (
+            <div
+              key={tag}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                pickSuggestion(tag);
+              }}
+              style={{
+                padding: "7px 10px",
+                fontSize: 13,
+                fontFamily: "Inter, sans-serif",
+                color: "#1C2B3A",
+                background: i === highlight ? "#EDE9DC" : "transparent",
+                cursor: "pointer",
+              }}
+            >
+              {tag}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const LedgerRow = ({ label, sub, amount, accent, onClick, right }) => (
+  <div
+    onClick={onClick}
+    style={{
+      display: "flex",
+      alignItems: "baseline",
+      gap: 8,
+      padding: "10px 2px",
+      borderBottom: "1px solid #D8D2C2",
+      cursor: onClick ? "pointer" : "default",
+    }}
+  >
+    <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+      <span style={{ fontFamily: "Inter, sans-serif", fontSize: 14.5, color: "#1C2B3A" }}>
+        {label}
+      </span>
+      {sub && (
+        <span style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: "#8B96A3" }}>
+          {sub}
+        </span>
+      )}
+    </div>
+    <div
+      style={{
+        flex: 1,
+        borderBottom: "1px dotted #C7BFA8",
+        transform: "translateY(-4px)",
+        margin: "0 6px",
+        minWidth: 12,
+      }}
+    />
+    {right ? (
+      right
+    ) : (
+      <span
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 14,
+          color: accent || "#1C2B3A",
+          fontWeight: 500,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {fmt(amount)}
+      </span>
+    )}
+  </div>
+);
+
+const SectionTitle = ({ children, eyebrow }) => (
+  <div style={{ marginBottom: 14 }}>
+    {eyebrow && (
+      <div
+        style={{
+          fontFamily: "Inter, sans-serif",
+          fontSize: 11,
+          letterSpacing: "0.08em",
+          textTransform: "uppercase",
+          color: "#8B96A3",
+          marginBottom: 2,
+        }}
+      >
+        {eyebrow}
+      </div>
+    )}
+    <h2
+      style={{
+        fontFamily: "'Fraunces', serif",
+        fontWeight: 500,
+        fontSize: 22,
+        color: "#1C2B3A",
+        margin: 0,
+      }}
+    >
+      {children}
+    </h2>
+  </div>
+);
+
+const Pill = ({ children, tone = "neutral" }) => {
+  const tones = {
+    neutral: { bg: "#EDE9DC", fg: "#5F5E5A" },
+    good: { bg: "#E4ECE4", fg: "#3B5C40" },
+    warn: { bg: "#F3E3DC", fg: "#8A3C28" },
+    gold: { bg: "#F1E6CC", fg: "#7A5D24" },
+  };
+  const t = tones[tone];
+  return (
+    <span
+      style={{
+        background: t.bg,
+        color: t.fg,
+        fontFamily: "Inter, sans-serif",
+        fontSize: 11.5,
+        fontWeight: 500,
+        padding: "3px 9px",
+        borderRadius: 20,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </span>
+  );
+};
+
+const Button = ({ children, onClick, variant = "default", style }) => {
+  const base = {
+    fontFamily: "Inter, sans-serif",
+    fontSize: 13.5,
+    fontWeight: 500,
+    padding: "8px 14px",
+    borderRadius: 6,
+    cursor: "pointer",
+    border: "1px solid #1C2B3A",
+    transition: "background 0.15s",
+  };
+  const variants = {
+    default: { background: "#1C2B3A", color: "#F7F4EC" },
+    ghost: { background: "transparent", color: "#1C2B3A" },
+    subtle: { background: "#EDE9DC", color: "#1C2B3A", border: "1px solid #D8D2C2" },
+  };
+  return (
+    <button onClick={onClick} style={{ ...base, ...variants[variant], ...style }}>
+      {children}
+    </button>
+  );
+};
+
+const Input = (props) => (
+  <input
+    {...props}
+    style={{
+      fontFamily: "Inter, sans-serif",
+      fontSize: 14,
+      padding: "8px 10px",
+      borderRadius: 6,
+      border: "1px solid #D8D2C2",
+      background: "#FFFEFB",
+      color: "#1C2B3A",
+      outline: "none",
+      ...props.style,
+    }}
+  />
+);
+
+const Card = ({ children, style }) => (
+  <div
+    style={{
+      background: "#FFFEFB",
+      border: "1px solid #E3DDC9",
+      borderRadius: 10,
+      padding: "18px 20px",
+      ...style,
+    }}
+  >
+    {children}
+  </div>
+);
+
+const ACCOUNT_DISPLAY_NAMES = {
+  savings: "Savings",
+  tax: "Taxes",
+  bills: "Bills",
+};
+
+/* A transfer row makes the amount and the from/to accounts equally prominent —
+   unlike a LedgerRow, where a long label can bury the dollar figure.
+   Falls back to deriving account names from `target`/legacy `label` for transfers
+   logged before fromAccount/toAccount existed.
+   Stacked layout: account chips + amount + action on the top line, note below —
+   avoids the from/to text and amount competing for the same horizontal space. */
+const TransferRow = ({ t, right }) => {
+  const fromAccount = t.fromAccount || "Checking";
+  const toAccount = t.toAccount || ACCOUNT_DISPLAY_NAMES[t.target] || t.target || "Account";
+  const note = t.note || t.label || null;
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+        padding: "14px 2px",
+        borderBottom: "1px solid #D8D2C2",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 8, minWidth: 0, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <span
+            style={{
+              fontFamily: "Inter, sans-serif",
+              fontSize: 10,
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+              color: "#8B96A3",
+            }}
+          >
+            From
+          </span>
+          <span
+            style={{
+              fontFamily: "Inter, sans-serif",
+              fontSize: 13,
+              color: "#5F5E5A",
+              background: "#EDE9DC",
+              padding: "3px 9px",
+              borderRadius: 20,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {fromAccount}
+          </span>
+        </div>
+        <i
+          className="ti ti-arrow-right"
+          style={{ fontSize: 14, color: "#8B96A3", flexShrink: 0, marginBottom: 5 }}
+          aria-hidden="true"
+        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <span
+            style={{
+              fontFamily: "Inter, sans-serif",
+              fontSize: 10,
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+              color: "#8B96A3",
+            }}
+          >
+            To
+          </span>
+          <span
+            style={{
+              fontFamily: "Inter, sans-serif",
+              fontSize: 13,
+              fontWeight: 500,
+              color: "#1C2B3A",
+              background: "#F1E6CC",
+              padding: "3px 9px",
+              borderRadius: 20,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {toAccount}
+          </span>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+        <span
+          style={{
+            fontFamily: "'IBM Plex Mono', monospace",
+            fontSize: 17,
+            fontWeight: 500,
+            color: "#1C2B3A",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {fmt(t.amount)}
+        </span>
+        {right}
+      </div>
+
+      {note && (
+        <span
+          style={{
+            fontFamily: "Inter, sans-serif",
+            fontSize: 12,
+            color: "#8B96A3",
+          }}
+        >
+          {note}
+        </span>
+      )}
+    </div>
+  );
+};
+
+
+/* tracks viewport width so layout can switch between desktop rail and mobile top bar */
+function useIsMobile(breakpoint = 720) {
+  const [isMobile, setIsMobile] = useState(
+    typeof window !== "undefined" ? window.innerWidth < breakpoint : false
+  );
+  useEffect(() => {
+    function onResize() {
+      setIsMobile(window.innerWidth < breakpoint);
+    }
+    window.addEventListener("resize", onResize);
+    onResize();
+    return () => window.removeEventListener("resize", onResize);
+  }, [breakpoint]);
+  return isMobile;
+}
+
+/* ---------- main app ---------- */
+function BudgetApp() {
+  const [state, setState] = useState(initialState);
+  const [loaded, setLoaded] = useState(false);
+  const [view, setView] = useState("dashboard");
+  const isMobile = useIsMobile();
+  const [navOpen, setNavOpen] = useState(!isMobile);
+
+  useEffect(() => {
+    (async () => {
+      const saved = await loadState();
+      let next = saved ? { ...initialState, ...saved } : { ...initialState, currentBillsMonthKey: monthKey() };
+      next = rolloverBillsIfNewMonth(next);
+      setState(next);
+      if (!next.setupCompleted) setView("setup");
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (loaded) saveState(state);
+  }, [state, loaded]);
+
+  const update = useCallback((fn) => {
+    setState((prev) => {
+      const next = typeof fn === "function" ? fn(prev) : fn;
+      return next;
+    });
+  }, []);
+
+  if (!loaded) {
+    return (
+      <div style={{ padding: 40, fontFamily: "Inter, sans-serif", color: "#8B96A3" }}>
+        Loading your ledger…
+      </div>
+    );
+  }
+
+  const nav = [
+    { id: "dashboard", label: "Dashboard", icon: "ti-home" },
+    { id: "transfers", label: "To Do", icon: "ti-check" },
+    { id: "shopping", label: "Shopping List", icon: "ti-folder" },
+    { id: "income", label: "Income", icon: "ti-chart-bar" },
+    { id: "invoices", label: "Invoices", icon: "ti-file" },
+    { id: "budgets", label: "Budgets", icon: "ti-calendar" },
+    { id: "goals", label: "Goals", icon: "ti-star" },
+    { id: "alerts", label: "Alerts", icon: "ti-bell" },
+    { id: "setup", label: "Setup", icon: "ti-settings" },
+  ];
+
+  function selectView(id) {
+    setView(id);
+    if (isMobile) setNavOpen(false);
+  }
+
+  const railWidth = navOpen ? (isMobile ? 220 : 188) : isMobile ? 0 : 56;
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        position: "relative",
+        width: "100%",
+        minHeight: 600,
+        background: "#F7F4EC",
+        fontFamily: "Inter, sans-serif",
+      }}
+    >
+      <link
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;500;600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      />
+
+      {/* mobile backdrop, tap to close the drawer */}
+      {isMobile && navOpen && (
+        <div
+          onClick={() => setNavOpen(false)}
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "rgba(28,43,58,0.35)",
+            zIndex: 15,
+          }}
+        />
+      )}
+
+      {/* left rail — collapsible on desktop (slim icon strip), overlay drawer on mobile */}
+      <div
+        style={{
+          width: railWidth,
+          flexShrink: 0,
+          borderRight: navOpen || !isMobile ? "1px solid #E3DDC9" : "none",
+          background: "#F7F4EC",
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+          padding: navOpen ? "16px 10px" : isMobile ? 0 : "16px 8px",
+          overflow: "hidden",
+          transition: "width 0.18s ease",
+          position: isMobile ? "absolute" : "relative",
+          top: 0,
+          bottom: 0,
+          left: 0,
+          zIndex: 16,
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: navOpen ? "space-between" : "center",
+            padding: navOpen ? "0 6px 14px" : "0 0 14px",
+            flexShrink: 0,
+          }}
+        >
+          {navOpen && (
+            <span
+              style={{
+                fontFamily: "'Fraunces', serif",
+                fontSize: 16,
+                color: "#1C2B3A",
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Ledger
+            </span>
+          )}
+          <div
+            onClick={() => setNavOpen((v) => !v)}
+            role="button"
+            aria-label={navOpen ? "Collapse menu" : "Expand menu"}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 3,
+              width: 30,
+              height: 30,
+              borderRadius: 6,
+              background: "#1C2B3A",
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+          >
+            <div style={{ width: 14, height: 2, borderRadius: 1, background: "#F7F4EC" }} />
+            <div style={{ width: 14, height: 2, borderRadius: 1, background: "#F7F4EC" }} />
+            <div style={{ width: 14, height: 2, borderRadius: 1, background: "#F7F4EC" }} />
+          </div>
+        </div>
+
+        {nav.map((n) => (
+          <div
+            key={n.id}
+            onClick={() => selectView(n.id)}
+            title={navOpen ? undefined : n.label}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: navOpen ? "9px 10px" : "9px 0",
+              justifyContent: navOpen ? "flex-start" : "center",
+              borderRadius: 6,
+              fontSize: 13.5,
+              fontWeight: 500,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+              color: view === n.id ? "#F7F4EC" : "#1C2B3A",
+              background: view === n.id ? "#1C2B3A" : "transparent",
+            }}
+          >
+            <i className={`ti ${n.icon}`} style={{ fontSize: 17, flexShrink: 0 }} aria-hidden="true" />
+            {navOpen && <span>{n.label}</span>}
+          </div>
+        ))}
+      </div>
+
+      {/* main */}
+      <div style={{ flex: 1, padding: isMobile ? "20px 16px" : "28px 32px", minWidth: 0 }}>
+        {isMobile && (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+            {!navOpen && (
+              <div
+                onClick={() => setNavOpen(true)}
+                role="button"
+                aria-label="Open menu"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 3,
+                  width: 38,
+                  height: 38,
+                  borderRadius: 6,
+                  cursor: "pointer",
+                  background: "#1C2B3A",
+                  flexShrink: 0,
+                }}
+              >
+                <div style={{ width: 16, height: 2, borderRadius: 1, background: "#F7F4EC" }} />
+                <div style={{ width: 16, height: 2, borderRadius: 1, background: "#F7F4EC" }} />
+                <div style={{ width: 16, height: 2, borderRadius: 1, background: "#F7F4EC" }} />
+              </div>
+            )}
+            {view === "dashboard" && (
+              <div>
+                <div
+                  style={{
+                    fontFamily: "Inter, sans-serif",
+                    fontSize: 11,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    color: "#8B96A3",
+                  }}
+                >
+                  {new Date().toLocaleDateString(undefined, { month: "long", year: "numeric" })}
+                </div>
+                <div
+                  style={{
+                    fontFamily: "'Fraunces', serif",
+                    fontWeight: 500,
+                    fontSize: 18,
+                    color: "#1C2B3A",
+                  }}
+                >
+                  Dashboard
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {view === "dashboard" && <Dashboard state={state} update={update} setView={setView} isMobile={isMobile} />}
+        {view === "income" && <IncomeView state={state} update={update} isMobile={isMobile} />}
+        {view === "invoices" && <InvoicesView state={state} update={update} isMobile={isMobile} />}
+        {view === "budgets" && <BudgetsView state={state} update={update} isMobile={isMobile} />}
+        {view === "goals" && <GoalsView state={state} update={update} isMobile={isMobile} />}
+        {view === "transfers" && <TransfersView state={state} update={update} isMobile={isMobile} />}
+        {view === "shopping" && <ShoppingListView state={state} update={update} isMobile={isMobile} />}
+        {view === "alerts" && <AlertsView state={state} update={update} isMobile={isMobile} />}
+        {view === "setup" && (
+          <SetupWizard state={state} update={update} isMobile={isMobile} onFinish={() => setView("dashboard")} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Dashboard ---------- */
+function Dashboard({ state, update, setView, isMobile }) {
+  const mKey = monthKey();
+  const split = useMemo(() => computeMonthlySplit(state, mKey), [state, mKey]);
+  const pace = useMemo(() => checkPaceAlert(state), [state]);
+  const moneyDateAlert = useMemo(() => checkMoneyDateAlert(state), [state]);
+  const spendingPaceAlerts = useMemo(() => checkSpendingPaceAlerts(state), [state]);
+  const weeklyProjection = useMemo(() => buildWeeklyProjection(state), [state]);
+
+  const sortedBills = [...state.bills].sort((a, b) => a.day - b.day);
+  const today = dayOfMonth();
+  const upcoming = sortedBills.filter((b) => b.day >= today).slice(0, 4);
+
+  const pendingTransfers = state.transfers.filter((t) => !t.done);
+  const unpaidInvoices = state.invoices.filter((i) => i.status === "unpaid");
+  const outstandingTotal = unpaidInvoices.reduce((s, i) => s + i.amount, 0);
+
+  return (
+    <div>
+      {!isMobile && (
+        <SectionTitle eyebrow={new Date().toLocaleDateString(undefined, { month: "long", year: "numeric" })}>
+          Dashboard
+        </SectionTitle>
+      )}
+
+      {state.alerts.billWinAlertOn && state.lastWin && (
+        <Card style={{ background: "#E4ECE4", border: "1px solid #A9C7AE", marginBottom: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontWeight: 500, color: "#3B5C40", fontSize: 14 }}>
+              <i className="ti ti-check" style={{ marginRight: 6, fontSize: 15, verticalAlign: "-2px" }} aria-hidden="true" />
+              {state.lastWin.billName} paid on time — nice work
+            </span>
+            <span
+              onClick={() => update((s) => ({ ...s, lastWin: null }))}
+              style={{ fontSize: 12, color: "#3B5C40", cursor: "pointer" }}
+            >
+              Dismiss
+            </span>
+          </div>
+        </Card>
+      )}
+
+      {state.moneyDate.enabled && moneyDateAlert.fires && (
+        <Card style={{ background: "#FBEAF0", border: "1px solid #EDB8CB", marginBottom: 18 }}>
+          <span style={{ fontWeight: 500, color: "#993556", fontSize: 14 }}>
+            Get ready for your money date <i className="ti ti-heart" style={{ verticalAlign: "-2px" }} aria-hidden="true" />{" "}
+            It's happening at{" "}
+            {moneyDateAlert.eventTime.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}.
+          </span>
+        </Card>
+      )}
+
+      {pace.fires && (
+        <Card style={{ background: "#F3E3DC", border: "1px solid #D9A98D", marginBottom: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span style={{ fontWeight: 500, color: "#8A3C28", fontSize: 14 }}>
+              Income is behind pace this month
+            </span>
+            <Pill tone="warn">Alert</Pill>
+          </div>
+          <div style={{ fontSize: 13, color: "#8A3C28", marginTop: 6, lineHeight: 1.5 }}>
+            Logged {fmt(pace.incomeThisMonth)} so far · projection pace expects{" "}
+            {fmt(pace.expectedByNow)} · paid bills and budgets due so far need {fmt(pace.neededSoFar)}.
+          </div>
+        </Card>
+      )}
+
+      {state.alerts.spendingPaceAlertOn && spendingPaceAlerts.length > 0 && (
+        <Card style={{ background: "#F3E3DC", border: "1px solid #D9A98D", marginBottom: 18 }}>
+          <span style={{ fontWeight: 500, color: "#8A3C28", fontSize: 14 }}>
+            Spending ahead of pace
+          </span>
+          <div style={{ marginTop: 6 }}>
+            {spendingPaceAlerts.map((c) => (
+              <div key={c.key} style={{ fontSize: 13, color: "#8A3C28", lineHeight: 1.6 }}>
+                {c.label}: {fmt(c.spent)} logged, {fmt(c.expectedByNow)} expected by today
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {state.alerts.weeklyProjectionAlertOn && (
+        <Card style={{ marginBottom: 18, cursor: "pointer" }} onClick={() => setView("budgets")}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+            <span style={{ fontWeight: 500, fontSize: 14, color: "#1C2B3A" }}>This week</span>
+            <span style={{ fontSize: 12, color: "#8B96A3" }}>Tap for budgets</span>
+          </div>
+          <div style={{ fontSize: 13, color: "#5F5E5A", lineHeight: 1.6 }}>
+            {weeklyProjection.upcoming.length === 0
+              ? "No bills due in the next 7 days."
+              : `${weeklyProjection.upcoming.length} bill${weeklyProjection.upcoming.length === 1 ? "" : "s"} due this week, totaling ${fmt(weeklyProjection.upcomingTotal)}.`}
+          </div>
+          <div style={{ fontSize: 13, color: "#5F5E5A", marginTop: 2 }}>
+            Available funds after those: {fmt(weeklyProjection.availableFunds)}
+          </div>
+        </Card>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 24 }}>
+        <MetricCard
+          label="Checking"
+          value={state.buckets.checking || 0}
+          editable
+          onChange={(v) => update((s) => ({ ...s, buckets: { ...s.buckets, checking: v } }))}
+        />
+        <MetricCard
+          label="Savings"
+          value={state.buckets.savings}
+          editable
+          onChange={(v) => update((s) => ({ ...s, buckets: { ...s.buckets, savings: v } }))}
+        />
+        <MetricCard label="Taxes" value={state.buckets.tax} />
+        <MetricCard
+          label="Bills"
+          value={state.buckets.bills}
+          editable
+          onChange={(v) => update((s) => ({ ...s, buckets: { ...s.buckets, bills: v } }))}
+        />
+        <MetricCard label="Slush fund" value={state.buckets.slush} tone="gold" />
+        <MetricCard label="STSS (goals)" value={state.buckets.stss} tone="gold" />
+      </div>
+
+      {unpaidInvoices.length > 0 && (
+        <Card style={{ marginBottom: 24, background: "#F8F0DC", border: "1px solid #E3D6A8" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span style={{ fontWeight: 500, fontSize: 14, color: "#7A5D24" }}>
+              Waiting on {unpaidInvoices.length} invoice{unpaidInvoices.length === 1 ? "" : "s"}
+            </span>
+            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 15, color: "#7A5D24" }}>
+              {fmt(outstandingTotal)}
+            </span>
+          </div>
+        </Card>
+      )}
+
+      {(() => {
+        const bailoutsThisMonth = state.bailouts.filter((b) => b.monthKey === mKey);
+        if (bailoutsThisMonth.length === 0) return null;
+        const total = bailoutsThisMonth.reduce((s, b) => s + b.amount, 0);
+        return (
+          <Card
+            style={{ marginBottom: 24, background: "#F3E3DC", border: "1px solid #D9A98D", cursor: "pointer" }}
+            onClick={() => setView("transfers")}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+              <span style={{ fontWeight: 500, fontSize: 14, color: "#8A3C28" }}>
+                {bailoutsThisMonth.length} bailout transfer{bailoutsThisMonth.length === 1 ? "" : "s"} this month
+              </span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 15, color: "#8A3C28" }}>
+                {fmt(total)}
+              </span>
+            </div>
+          </Card>
+        );
+      })()}
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1.3fr 1fr", gap: 20 }}>
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontWeight: 500, fontSize: 14.5, color: "#1C2B3A" }}>
+              Upcoming bills
+            </span>
+            <span
+              style={{ fontSize: 12.5, color: "#8B96A3", cursor: "pointer" }}
+              onClick={() => setView("budgets")}
+            >
+              View all
+            </span>
+          </div>
+          <Ledger>
+            {upcoming.length === 0 && (
+              <div style={{ fontSize: 13, color: "#8B96A3", padding: "8px 2px" }}>
+                Nothing left due this month.
+              </div>
+            )}
+            {upcoming.map((b) => (
+              <LedgerRow
+                key={b.id}
+                label={b.name}
+                sub={`Due on the ${ordinal(b.day)}`}
+                amount={b.amount}
+                right={
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <EditableAmount
+                      value={b.amount}
+                      tone={b.paid ? "#6B8F71" : "#1C2B3A"}
+                      strikethrough={!!b.paid}
+                      onChange={(v) =>
+                        update((s) => ({
+                          ...s,
+                          bills: s.bills.map((x) => (x.id === b.id ? { ...x, amount: v } : x)),
+                        }))
+                      }
+                    />
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 4,
+                        fontSize: 11.5,
+                        color: "#8B96A3",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!!b.paid}
+                        onChange={() => update((s) => markBillPaid(s, b.id))}
+                      />
+                      Paid
+                    </label>
+                  </div>
+                }
+              />
+            ))}
+          </Ledger>
+        </Card>
+
+        <Card>
+          <div style={{ fontWeight: 500, fontSize: 14.5, color: "#1C2B3A", marginBottom: 8 }}>
+            Pending transfers
+          </div>
+          {pendingTransfers.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#8B96A3" }}>
+              No transfers waiting on you right now.
+            </div>
+          ) : (
+            <Ledger>
+              {pendingTransfers.map((t) => (
+                <TransferRow
+                  key={t.id}
+                  t={t}
+                  right={
+                    <Button
+                      variant="subtle"
+                      style={{ padding: "5px 10px", fontSize: 12 }}
+                      onClick={() =>
+                        update((s) => ({
+                          ...s,
+                          transfers: s.transfers.map((x) =>
+                            x.id === t.id ? { ...x, done: true } : x
+                          ),
+                        }))
+                      }
+                    >
+                      Mark done
+                    </Button>
+                  }
+                />
+              ))}
+            </Ledger>
+          )}
+        </Card>
+      </div>
+
+      <div style={{ marginTop: 20 }}>
+        <Card>
+          <div style={{ fontWeight: 500, fontSize: 14.5, color: "#1C2B3A", marginBottom: 10 }}>
+            This month so far
+          </div>
+          <Ledger>
+            <LedgerRow label="Income logged" amount={split.totalIncome} />
+            <LedgerRow label="Tax set-aside (freelance)" amount={-split.freelanceTax} accent="#8A3C28" />
+            <LedgerRow label="Savings (10% freelance + $50/paycheck)" amount={-split.savingsLoggedTotal} accent="#3B5C40" />
+            <LedgerRow label="Bills paid so far" amount={-split.paidBillsTotal} accent="#6B8F71" />
+            <LedgerRow label="Bills still unpaid" amount={-split.unpaidBillsTotal} accent="#C1684F" />
+            <LedgerRow label="Total budgets (planned)" amount={-split.totalBudgets} />
+            <LedgerRow
+              label="Leftover (slush + STSS, split evenly)"
+              amount={split.leftover}
+              accent={split.leftover < 0 ? "#8A3C28" : "#3B5C40"}
+            />
+          </Ledger>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, tone, editable, onChange }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const colors = {
+    default: "#1C2B3A",
+    gold: "#7A5D24",
+  };
+
+  function commit() {
+    const v = parseFloat(draft);
+    onChange(isNaN(v) ? value : round2(v));
+    setEditing(false);
+  }
+
+  return (
+    <div
+      style={{
+        background: tone === "gold" ? "#F8F0DC" : "#EDE9DC",
+        borderRadius: 8,
+        padding: "14px 16px",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>{label}</div>
+        {editable && !editing && (
+          <i
+            className="ti ti-edit"
+            onClick={() => {
+              setDraft(value);
+              setEditing(true);
+            }}
+            style={{ fontSize: 14, color: "#8B96A3", cursor: "pointer" }}
+            aria-label="Edit balance"
+          />
+        )}
+      </div>
+      {editing ? (
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <Input
+            type="number"
+            value={draft}
+            autoFocus
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit();
+              if (e.key === "Escape") setEditing(false);
+            }}
+            style={{ width: 90, fontSize: 15, padding: "5px 8px" }}
+          />
+          <i
+            className="ti ti-check"
+            onClick={commit}
+            style={{ fontSize: 16, color: "#3B5C40", cursor: "pointer" }}
+            aria-label="Save"
+          />
+        </div>
+      ) : (
+        <div
+          style={{
+            fontFamily: "'IBM Plex Mono', monospace",
+            fontSize: 19,
+            fontWeight: 500,
+            color: colors[tone] || colors.default,
+          }}
+        >
+          {fmt(value)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+/* ---------- Income View ---------- */
+function IncomeView({ state, update, isMobile }) {
+  const [amount, setAmount] = useState("");
+  const [type, setType] = useState("regular");
+  const [date, setDate] = useState(todayISO());
+  const mKey = monthKey();
+
+  const monthIncome = state.income.filter((i) => i.monthKey === mKey);
+  const totalThisMonth = monthIncome.reduce((s, i) => s + i.amount, 0);
+  const projection = state.monthlyIncomeProjection;
+
+  function addIncome() {
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) return;
+    const entry = {
+      id: uid("inc"),
+      date,
+      amount: round2(amt),
+      type,
+      monthKey: monthKey(parseLocalDate(date)),
+    };
+
+    update((s) => {
+      const moves = allocateIncome(entry, s);
+      const newBuckets = { ...s.buckets };
+      const newTransfers = [...s.transfers];
+
+      moves.forEach((m) => {
+        newBuckets[m.bucket] = round2((newBuckets[m.bucket] || 0) + m.amount);
+        if (m.bucket === "savings" || m.bucket === "tax" || m.bucket === "bills") {
+          newTransfers.push({
+            id: uid("xfer"),
+            fromAccount: "Checking",
+            toAccount: ACCOUNT_DISPLAY_NAMES[m.bucket] || m.bucket,
+            amount: m.amount,
+            note: m.note,
+            target: m.bucket,
+            done: !!m.alreadyDeducted, // $50 pre-checking transfer is already done by the bank
+            createdAt: entry.date,
+            monthKey: entry.monthKey,
+          });
+        }
+      });
+
+      // recompute monthly split for slush/STSS based on updated income
+      const tempState = { ...s, income: [...s.income, entry] };
+      const split = computeMonthlySplit(tempState, entry.monthKey);
+
+      // Recompute slush/STSS from scratch each time income changes this month,
+      // by resetting to the freshly computed split (idempotent w.r.t. all income logged).
+      newBuckets.slush = split.slushAdd;
+      newBuckets.stss = split.stssAdd;
+
+      return {
+        ...s,
+        income: [...s.income, entry],
+        buckets: newBuckets,
+        transfers: newTransfers,
+      };
+    });
+
+    setAmount("");
+  }
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Variable income">Income</SectionTitle>
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 20, marginBottom: 24 }}>
+        <Card>
+          <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>
+            Logged this month
+          </div>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 26, color: "#1C2B3A" }}>
+            {fmt(totalThisMonth)}
+          </div>
+          <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 4 }}>
+            of {fmt(projection)} projected
+          </div>
+          <div
+            style={{
+              height: 6,
+              background: "#EDE9DC",
+              borderRadius: 4,
+              marginTop: 10,
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                height: "100%",
+                width: `${Math.min(100, (totalThisMonth / projection) * 100)}%`,
+                background: totalThisMonth >= projection ? "#6B8F71" : "#B8924A",
+              }}
+            />
+          </div>
+        </Card>
+
+        <Card>
+          <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 8 }}>
+            Monthly income projection
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <Input
+              type="number"
+              value={projection}
+              onChange={(e) =>
+                update((s) => ({ ...s, monthlyIncomeProjection: parseFloat(e.target.value) || 0 }))
+              }
+              style={{ width: 120 }}
+            />
+            <span style={{ fontSize: 12.5, color: "#8B96A3" }}>
+              Adjust as your estimate for the month changes
+            </span>
+          </div>
+        </Card>
+      </div>
+
+      <Card style={{ marginBottom: 24 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Log a paycheck</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Amount</div>
+            <Input
+              type="number"
+              placeholder="0.00"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              style={{ width: 110 }}
+            />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Date</div>
+            <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Type</div>
+            <select
+              value={type}
+              onChange={(e) => setType(e.target.value)}
+              style={{
+                fontFamily: "Inter, sans-serif",
+                fontSize: 14,
+                padding: "8px 10px",
+                borderRadius: 6,
+                border: "1px solid #D8D2C2",
+                background: "#FFFEFB",
+                color: "#1C2B3A",
+              }}
+            >
+              <option value="regular">Regular</option>
+              <option value="freelance">Freelance</option>
+            </select>
+          </div>
+          <Button onClick={addIncome}>Log income</Button>
+        </div>
+        {type === "freelance" ? (
+          <div style={{ fontSize: 12, color: "#8B96A3", marginTop: 10 }}>
+            15% will be set aside for taxes automatically, then 10% to savings, before bills and
+            budgets.
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: "#8B96A3", marginTop: 10 }}>
+            Enter the amount that actually lands in checking — the $50 automatic savings transfer
+            happens before that and gets logged separately.
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 8 }}>This month's entries</div>
+        {monthIncome.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>No income logged yet this month.</div>
+        ) : (
+          <Ledger>
+            {monthIncome
+              .slice()
+              .reverse()
+              .map((i) => (
+                <LedgerRow
+                  key={i.id}
+                  label={i.type === "freelance" ? "Freelance income" : "Regular income"}
+                  sub={formatLocalDate(i.date)}
+                  amount={i.amount}
+                />
+              ))}
+          </Ledger>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ---------- Invoices View ---------- */
+function InvoicesView({ state, update, isMobile }) {
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
+  const [issueDate, setIssueDate] = useState(todayISO());
+
+  const unpaid = state.invoices.filter((i) => i.status === "unpaid");
+  const paid = state.invoices.filter((i) => i.status === "paid");
+  const totalUnpaid = unpaid.reduce((s, i) => s + i.amount, 0);
+
+  function addInvoice() {
+    const amt = parseFloat(amount);
+    if (!description || !amt || amt <= 0) return;
+    update((s) => ({
+      ...s,
+      invoices: [
+        ...s.invoices,
+        {
+          id: uid("inv"),
+          description,
+          amount: round2(amt),
+          issueDate,
+          status: "unpaid",
+          paidDate: null,
+          incomeId: null,
+        },
+      ],
+    }));
+    setDescription("");
+    setAmount("");
+    setIssueDate(todayISO());
+  }
+
+  function markPaid(invoiceId) {
+    update((s) => convertInvoiceToIncome(s, invoiceId));
+  }
+
+  return (
+    <div>
+      <SectionTitle eyebrow="What you're still waiting on">Invoices</SectionTitle>
+
+      <Card style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>Outstanding</div>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 26, color: "#1C2B3A" }}>
+          {fmt(totalUnpaid)}
+        </div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 4 }}>
+          across {unpaid.length} unpaid invoice{unpaid.length === 1 ? "" : "s"}
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 24 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Add an invoice</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Description</div>
+            <Input
+              placeholder="e.g. Acme Co. — website project"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              style={{ width: 220 }}
+            />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Amount</div>
+            <Input
+              type="number"
+              placeholder="0.00"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              style={{ width: 110 }}
+            />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Issue date</div>
+            <Input type="date" value={issueDate} onChange={(e) => setIssueDate(e.target.value)} />
+          </div>
+          <Button onClick={addInvoice}>Add invoice</Button>
+        </div>
+        <div style={{ fontSize: 12, color: "#8B96A3", marginTop: 10 }}>
+          When marked paid, this becomes freelance income dated today — 15% set aside for taxes,
+          10% to savings — while the issue date stays on record here.
+        </div>
+      </Card>
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 20 }}>
+        <Card>
+          <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Unpaid</div>
+          {unpaid.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing outstanding right now.</div>
+          ) : (
+            <Ledger>
+              {unpaid
+                .slice()
+                .sort((a, b) => parseLocalDate(a.issueDate) - parseLocalDate(b.issueDate))
+                .map((i) => (
+                  <LedgerRow
+                    key={i.id}
+                    label={i.description}
+                    sub={`Issued ${formatLocalDate(i.issueDate)}`}
+                    amount={i.amount}
+                    right={
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14 }}>
+                          {fmt(i.amount)}
+                        </span>
+                        <Button
+                          variant="subtle"
+                          style={{ padding: "5px 10px", fontSize: 12 }}
+                          onClick={() => markPaid(i.id)}
+                        >
+                          Mark paid
+                        </Button>
+                      </div>
+                    }
+                  />
+                ))}
+            </Ledger>
+          )}
+        </Card>
+
+        <Card>
+          <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10, color: "#8B96A3" }}>
+            Paid history
+          </div>
+          {paid.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#8B96A3" }}>None yet.</div>
+          ) : (
+            <Ledger>
+              {paid
+                .slice()
+                .sort((a, b) => parseLocalDate(b.paidDate) - parseLocalDate(a.paidDate))
+                .map((i) => (
+                  <LedgerRow
+                    key={i.id}
+                    label={i.description}
+                    sub={`Issued ${formatLocalDate(i.issueDate)} · paid ${formatLocalDate(i.paidDate)}`}
+                    amount={i.amount}
+                    accent="#8B96A3"
+                  />
+                ))}
+            </Ledger>
+          )}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+
+function BudgetsView({ state, update, isMobile }) {
+  const [newBillName, setNewBillName] = useState("");
+  const [newBillAmount, setNewBillAmount] = useState("");
+  const [newBillDay, setNewBillDay] = useState("");
+  const [tagDrafts, setTagDrafts] = useState({}); // { [categoryKey]: rawCommaSeparatedString }
+  const [expandedTags, setExpandedTags] = useState({}); // { [categoryKey]: boolean }
+  const [otherExpanded, setOtherExpanded] = useState(true);
+
+  const today = dayOfMonth();
+  const totalDays = daysInMonth();
+  const pace = today / totalDays;
+
+  function addBill() {
+    if (!newBillName || !newBillAmount || !newBillDay) return;
+    update((s) => ({
+      ...s,
+      bills: [
+        ...s.bills,
+        { id: uid("bill"), name: newBillName, amount: parseFloat(newBillAmount), day: parseInt(newBillDay) },
+      ],
+    }));
+    setNewBillName("");
+    setNewBillAmount("");
+    setNewBillDay("");
+  }
+
+  function removeBill(id) {
+    update((s) => ({ ...s, bills: s.bills.filter((b) => b.id !== id) }));
+  }
+
+  function spentInCategory(cat, mKey) {
+    return state.spending
+      .filter((sp) => sp.category === cat && sp.monthKey === mKey)
+      .reduce((sum, sp) => sum + sp.amount, 0);
+  }
+
+  // all tags ever used, for auto-suggest across every category.
+  // falls back to legacy single `tag` field for entries logged before multi-tag support.
+  const allKnownTags = useMemo(() => {
+    const set = new Set();
+    state.spending.forEach((sp) => {
+      const tags = sp.tags && sp.tags.length ? sp.tags : sp.tag ? [sp.tag] : [];
+      tags.forEach((t) => set.add(t));
+    });
+    return Array.from(set).sort();
+  }, [state.spending]);
+
+  function tagBreakdown(cat, mKey) {
+    const entries = state.spending.filter((sp) => sp.category === cat && sp.monthKey === mKey);
+    const groups = {};
+    entries.forEach((sp) => {
+      const tags = sp.tags && sp.tags.length ? sp.tags : sp.tag ? [sp.tag] : [];
+      if (tags.length === 0) {
+        groups["Untagged"] = (groups["Untagged"] || 0) + sp.amount;
+      } else {
+        // an entry with multiple tags counts its full amount toward each tag's total,
+        // since the categories aren't mutually exclusive (e.g. a Costco trip can be
+        // both "household" and "gifts")
+        tags.forEach((tag) => {
+          groups[tag] = (groups[tag] || 0) + sp.amount;
+        });
+      }
+    });
+    return Object.entries(groups).sort((a, b) => b[1] - a[1]);
+  }
+
+  const mKey = monthKey();
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Bills & spending limits">Budgets</SectionTitle>
+
+      <Card style={{ marginBottom: 24 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Recurring bills</div>
+        <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 10 }}>
+          Click an amount to adjust it for small fluctuations.
+        </div>
+        <Ledger>
+          {[...state.bills]
+            .sort((a, b) => a.day - b.day)
+            .map((b) => (
+              <LedgerRow
+                key={b.id}
+                label={b.name}
+                sub={`Due on the ${ordinal(b.day)}`}
+                amount={b.amount}
+                right={
+                  <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                    <EditableAmount
+                      value={b.amount}
+                      tone={b.paid ? "#6B8F71" : "#1C2B3A"}
+                      strikethrough={!!b.paid}
+                      onChange={(v) =>
+                        update((s) => ({
+                          ...s,
+                          bills: s.bills.map((x) => (x.id === b.id ? { ...x, amount: v } : x)),
+                        }))
+                      }
+                    />
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 4,
+                        fontSize: 11.5,
+                        color: "#8B96A3",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!!b.paid}
+                        onChange={() => update((s) => markBillPaid(s, b.id))}
+                      />
+                      Paid
+                    </label>
+                    <span
+                      onClick={() => removeBill(b.id)}
+                      style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}
+                    >
+                      Remove
+                    </span>
+                  </div>
+                }
+              />
+            ))}
+        </Ledger>
+        <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
+          <Input
+            placeholder="Bill name"
+            value={newBillName}
+            onChange={(e) => setNewBillName(e.target.value)}
+            style={{ width: 160 }}
+          />
+          <Input
+            placeholder="Amount"
+            type="number"
+            value={newBillAmount}
+            onChange={(e) => setNewBillAmount(e.target.value)}
+            style={{ width: 90 }}
+          />
+          <Input
+            placeholder="Day (1-31)"
+            type="number"
+            min="1"
+            max="31"
+            value={newBillDay}
+            onChange={(e) => setNewBillDay(e.target.value)}
+            style={{ width: 100 }}
+          />
+          <Button variant="subtle" onClick={addBill}>
+            Add bill
+          </Button>
+        </div>
+      </Card>
+
+      <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>
+        Groceries, gas & eating out
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(3, minmax(0, 1fr))", gap: 16 }}>
+        {Object.entries(state.budgets).map(([key, b]) => {
+          const spent = spentInCategory(key, mKey);
+          const weeklyTarget = b.monthly / 4.33;
+          const weekNum = Math.ceil(today / 7);
+          const weeklyBudgetSoFar = weeklyTarget * weekNum;
+          const pct = Math.min(100, (spent / b.monthly) * 100);
+          const over = spent > b.monthly * pace + 0.01;
+
+          return (
+            <Card key={key}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontWeight: 500, fontSize: 14 }}>{b.label}</span>
+                {over && <Pill tone="warn">Ahead of pace</Pill>}
+              </div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 20, color: "#1C2B3A" }}>
+                {fmt(spent)}
+              </div>
+              <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 8 }}>
+                of {fmt(b.monthly)} this month
+              </div>
+              <div
+                style={{
+                  height: 6,
+                  background: "#EDE9DC",
+                  borderRadius: 4,
+                  overflow: "hidden",
+                  marginBottom: 10,
+                }}
+              >
+                <div
+                  style={{
+                    height: "100%",
+                    width: `${pct}%`,
+                    background: over ? "#C1684F" : "#6B8F71",
+                  }}
+                />
+              </div>
+              <div style={{ fontSize: 12, color: "#8B96A3" }}>
+                Week {weekNum}: {fmt(spentInCategory(key, mKey))} logged ·{" "}
+                {fmt(weeklyTarget)}/wk target
+              </div>
+              <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+                <Input
+                  type="number"
+                  placeholder="Log spend"
+                  id={`spend-${key}`}
+                  style={{ flex: 1, minWidth: 0 }}
+                />
+                <Button
+                  variant="subtle"
+                  style={{ padding: "6px 10px", fontSize: 12, flexShrink: 0 }}
+                  onClick={() => {
+                    const el = document.getElementById(`spend-${key}`);
+                    const val = parseFloat(el.value);
+                    if (!val) return;
+                    const tags = parseTags(tagDrafts[key]);
+                    update((s) => ({
+                      ...s,
+                      spending: [
+                        ...s.spending,
+                        {
+                          id: uid("sp"),
+                          category: key,
+                          amount: val,
+                          date: todayISO(),
+                          monthKey: mKey,
+                          tags,
+                        },
+                      ],
+                    }));
+                    el.value = "";
+                    setTagDrafts((d) => ({ ...d, [key]: "" }));
+                  }}
+                >
+                  Add
+                </Button>
+              </div>
+              <div style={{ marginTop: 6 }}>
+                <TagInput
+                  placeholder="Tags, comma separated (optional)"
+                  knownTags={allKnownTags}
+                  value={tagDrafts[key] || ""}
+                  onChange={(val) => setTagDrafts((d) => ({ ...d, [key]: val }))}
+                  style={{ fontSize: 12.5 }}
+                />
+              </div>
+
+              {(() => {
+                const breakdown = tagBreakdown(key, mKey);
+                const isOpen = !!expandedTags[key];
+                if (breakdown.length === 0) return null;
+                return (
+                  <div style={{ marginTop: 10, borderTop: "1px solid #E3DDC9", paddingTop: 8 }}>
+                    <div
+                      onClick={() => setExpandedTags((e) => ({ ...e, [key]: !e[key] }))}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: "#8B96A3" }}>
+                        By tag ({breakdown.length})
+                      </span>
+                      <i
+                        className={`ti ti-chevron-${isOpen ? "up" : "down"}`}
+                        style={{ fontSize: 14, color: "#8B96A3" }}
+                        aria-hidden="true"
+                      />
+                    </div>
+                    {isOpen && (
+                      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                        {breakdown.map(([tag, total]) => (
+                          <div
+                            key={tag}
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              fontSize: 12,
+                              color: "#5F5E5A",
+                            }}
+                          >
+                            <span
+                              style={{
+                                background: tag === "Untagged" ? "transparent" : "#EDE9DC",
+                                padding: tag === "Untagged" ? 0 : "1px 7px",
+                                borderRadius: 12,
+                              }}
+                            >
+                              {tag}
+                            </span>
+                            <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+                              {fmt(total)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              <div style={{ marginTop: 8 }}>
+                <Input
+                  type="number"
+                  value={b.monthly}
+                  onChange={(e) =>
+                    update((s) => ({
+                      ...s,
+                      budgets: {
+                        ...s.budgets,
+                        [key]: { ...s.budgets[key], monthly: parseFloat(e.target.value) || 0 },
+                      },
+                    }))
+                  }
+                  style={{ width: "100%", fontSize: 12 }}
+                />
+                <div style={{ fontSize: 11, color: "#8B96A3", marginTop: 2 }}>
+                  Edit monthly limit
+                </div>
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+
+      <div style={{ marginTop: 28 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Other spending</div>
+        <Card>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 12 }}>
+            For anything that doesn't fit groceries, gas, or eating out — no monthly limit, just
+            a running log.
+          </div>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 20, color: "#1C2B3A" }}>
+            {fmt(spentInCategory("other", mKey))}
+          </div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 12 }}>logged this month</div>
+
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <Input
+              type="number"
+              placeholder="Log spend"
+              id="spend-other"
+              style={{ flex: 1, minWidth: 100 }}
+            />
+            <TagInput
+              placeholder="Tags, comma separated (optional)"
+              knownTags={allKnownTags}
+              value={tagDrafts.other || ""}
+              onChange={(val) => setTagDrafts((d) => ({ ...d, other: val }))}
+              style={{ flex: 2, minWidth: 160 }}
+            />
+            <Button
+              variant="subtle"
+              style={{ padding: "6px 10px", fontSize: 12, flexShrink: 0 }}
+              onClick={() => {
+                const el = document.getElementById("spend-other");
+                const val = parseFloat(el.value);
+                if (!val) return;
+                const tags = parseTags(tagDrafts.other);
+                update((s) => ({
+                  ...s,
+                  spending: [
+                    ...s.spending,
+                    {
+                      id: uid("sp"),
+                      category: "other",
+                      amount: val,
+                      date: todayISO(),
+                      monthKey: mKey,
+                      tags,
+                    },
+                  ],
+                }));
+                el.value = "";
+                setTagDrafts((d) => ({ ...d, other: "" }));
+              }}
+            >
+              Add
+            </Button>
+          </div>
+
+          {(() => {
+            const entries = state.spending
+              .filter((sp) => sp.category === "other" && sp.monthKey === mKey)
+              .slice()
+              .reverse();
+            if (entries.length === 0) return null;
+            return (
+              <div style={{ marginTop: 14, borderTop: "1px solid #E3DDC9", paddingTop: 10 }}>
+                <div
+                  onClick={() => setOtherExpanded((v) => !v)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    cursor: "pointer",
+                    marginBottom: otherExpanded ? 8 : 0,
+                  }}
+                >
+                  <span style={{ fontSize: 12, color: "#8B96A3" }}>
+                    {entries.length} entr{entries.length === 1 ? "y" : "ies"} this month
+                  </span>
+                  <i
+                    className={`ti ti-chevron-${otherExpanded ? "up" : "down"}`}
+                    style={{ fontSize: 14, color: "#8B96A3" }}
+                    aria-hidden="true"
+                  />
+                </div>
+                {otherExpanded && (
+                  <Ledger>
+                    {entries.map((sp) => (
+                      <LedgerRow
+                        key={sp.id}
+                        label={sp.description ? sp.description : (sp.tags && sp.tags.length ? sp.tags.join(", ") : "Untagged")}
+                        sub={`${formatLocalDate(sp.date)}${sp.description && sp.tags && sp.tags.length ? " · " + sp.tags.join(", ") : ""}`}
+                        amount={sp.amount}
+                      />
+                    ))}
+                  </Ledger>
+                )}
+              </div>
+            );
+          })()}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Shopping List View ---------- */
+function ShoppingListView({ state, update, isMobile }) {
+  const [newItemName, setNewItemName] = useState("");
+
+  function addItem() {
+    if (!newItemName.trim()) return;
+    update((s) => ({
+      ...s,
+      shoppingList: [...s.shoppingList, { id: uid("item"), name: newItemName.trim(), checked: false }],
+    }));
+    setNewItemName("");
+  }
+
+  const remaining = state.shoppingList.filter((i) => !i.checked).length;
+
+  return (
+    <div>
+      <SectionTitle eyebrow={`${remaining} item${remaining === 1 ? "" : "s"} left`}>Shopping list</SectionTitle>
+
+      <Card>
+        <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+          <Input
+            placeholder="Add an item"
+            value={newItemName}
+            onChange={(e) => setNewItemName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") addItem();
+            }}
+            style={{ flex: 1 }}
+          />
+          <Button variant="subtle" onClick={addItem}>
+            Add
+          </Button>
+        </div>
+
+        {state.shoppingList.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing on the list yet.</div>
+        ) : (
+          <Ledger>
+            {state.shoppingList.map((item) => (
+              <LedgerRow
+                key={item.id}
+                label={
+                  <span
+                    style={{
+                      textDecoration: item.checked ? "line-through" : "none",
+                      color: item.checked ? "#8B96A3" : "#1C2B3A",
+                    }}
+                  >
+                    {item.name}
+                  </span>
+                }
+                right={
+                  <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={item.checked}
+                      onChange={() =>
+                        update((s) => ({
+                          ...s,
+                          shoppingList: s.shoppingList.map((x) =>
+                            x.id === item.id ? { ...x, checked: !x.checked } : x
+                          ),
+                        }))
+                      }
+                    />
+                    <span
+                      onClick={() =>
+                        update((s) => ({
+                          ...s,
+                          shoppingList: s.shoppingList.filter((x) => x.id !== item.id),
+                        }))
+                      }
+                      style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}
+                    >
+                      Remove
+                    </span>
+                  </div>
+                }
+              />
+            ))}
+          </Ledger>
+        )}
+
+        {state.shoppingList.some((i) => i.checked) && (
+          <div style={{ marginTop: 10, textAlign: "right" }}>
+            <span
+              onClick={() =>
+                update((s) => ({
+                  ...s,
+                  shoppingList: s.shoppingList.filter((x) => !x.checked),
+                }))
+              }
+              style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}
+            >
+              Clear checked items
+            </span>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ---------- Goals View ---------- */
+function GoalsView({ state, update, isMobile }) {
+  const [name, setName] = useState("");
+  const [cost, setCost] = useState("");
+  const [hasDeadline, setHasDeadline] = useState(false);
+  const [deadline, setDeadline] = useState("");
+
+  const wishlist = state.goals.filter((g) => g.status === "wishlist");
+  const active = state.goals.filter((g) => g.status === "active");
+
+  function addGoal() {
+    if (!name || !cost) return;
+    update((s) => ({
+      ...s,
+      goals: [
+        ...s.goals,
+        {
+          id: uid("goal"),
+          name,
+          cost: parseFloat(cost),
+          hasDeadline,
+          deadline: hasDeadline ? deadline : null,
+          status: "wishlist",
+          weeklyOverride: null,
+          saved: 0,
+        },
+      ],
+    }));
+    setName("");
+    setCost("");
+    setHasDeadline(false);
+    setDeadline("");
+  }
+
+  function promote(id) {
+    update((s) => ({
+      ...s,
+      goals: s.goals.map((g) => (g.id === id ? { ...g, status: "active" } : g)),
+    }));
+  }
+
+  function suggestedWeekly(goal) {
+    if (goal.weeklyOverride != null) return goal.weeklyOverride;
+    if (!goal.hasDeadline || !goal.deadline) return round2(goal.cost / 12); // default: ~3 months
+    const weeksLeft = Math.max(
+      1,
+      Math.ceil((parseLocalDate(goal.deadline) - new Date()) / (1000 * 60 * 60 * 24 * 7))
+    );
+    return round2((goal.cost - (goal.saved || 0)) / weeksLeft);
+  }
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Wishlist & active savings goals">Goals</SectionTitle>
+
+      <Card style={{ marginBottom: 24 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Add a goal</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Name</div>
+            <Input
+              placeholder="e.g. New couch"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              style={{ width: 180 }}
+            />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Estimated cost</div>
+            <Input
+              type="number"
+              placeholder="0.00"
+              value={cost}
+              onChange={(e) => setCost(e.target.value)}
+              style={{ width: 110 }}
+            />
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingBottom: 8 }}>
+            <input
+              type="checkbox"
+              checked={hasDeadline}
+              onChange={(e) => setHasDeadline(e.target.checked)}
+              id="deadline-toggle"
+            />
+            <label htmlFor="deadline-toggle" style={{ fontSize: 13, color: "#1C2B3A" }}>
+              Has a deadline
+            </label>
+          </div>
+          {hasDeadline && (
+            <div>
+              <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Deadline</div>
+              <Input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)} />
+            </div>
+          )}
+          <Button onClick={addGoal}>Add to wishlist</Button>
+        </div>
+      </Card>
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 20 }}>
+        <Card>
+          <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Wishlist</div>
+          {wishlist.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing on the wishlist yet.</div>
+          ) : (
+            <Ledger>
+              {wishlist.map((g) => (
+                <LedgerRow
+                  key={g.id}
+                  label={g.name}
+                  sub={g.hasDeadline ? `By ${formatLocalDate(g.deadline)}` : "No deadline"}
+                  amount={g.cost}
+                  right={
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14 }}>
+                        {fmt(g.cost)}
+                      </span>
+                      <Button
+                        variant="subtle"
+                        style={{ padding: "5px 10px", fontSize: 12 }}
+                        onClick={() => promote(g.id)}
+                      >
+                        Activate
+                      </Button>
+                    </div>
+                  }
+                />
+              ))}
+            </Ledger>
+          )}
+        </Card>
+
+        <Card>
+          <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Active goals</div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 10 }}>
+            Funded from the STSS bucket — currently {fmt(state.buckets.stss)}
+          </div>
+          {active.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#8B96A3" }}>No active goals yet.</div>
+          ) : (
+            <Ledger>
+              {active.map((g) => {
+                const weekly = suggestedWeekly(g);
+                const pct = Math.min(100, ((g.saved || 0) / g.cost) * 100);
+                return (
+                  <div key={g.id} style={{ padding: "10px 2px", borderBottom: "1px solid #D8D2C2" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ fontSize: 14, color: "#1C2B3A" }}>{g.name}</span>
+                      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>
+                        {fmt(g.saved || 0)} / {fmt(g.cost)}
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        height: 5,
+                        background: "#EDE9DC",
+                        borderRadius: 4,
+                        overflow: "hidden",
+                        margin: "6px 0",
+                      }}
+                    >
+                      <div
+                        style={{
+                          height: "100%",
+                          width: `${pct}%`,
+                          background: "#B8924A",
+                        }}
+                      />
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12, color: "#8B96A3" }}>
+                      <span>Suggested {fmt(weekly)}/wk</span>
+                      <Input
+                        type="number"
+                        placeholder="Override"
+                        defaultValue={g.weeklyOverride || ""}
+                        style={{ width: 80, fontSize: 12, padding: "4px 8px" }}
+                        onBlur={(e) =>
+                          update((s) => ({
+                            ...s,
+                            goals: s.goals.map((x) =>
+                              x.id === g.id
+                                ? { ...x, weeklyOverride: parseFloat(e.target.value) || null }
+                                : x
+                            ),
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </Ledger>
+          )}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Transfers View ---------- */
+function TransfersView({ state, update, isMobile }) {
+  const pending = state.transfers.filter((t) => !t.done);
+  const done = state.transfers.filter((t) => t.done);
+
+  const [fromBucket, setFromBucket] = useState("savings");
+  const [toBucket, setToBucket] = useState("bills");
+  const [amount, setAmount] = useState("");
+  const [reason, setReason] = useState("");
+
+  const mKey = monthKey();
+  const bailoutsThisMonth = state.bailouts.filter((b) => b.monthKey === mKey);
+  const totalThisMonth = bailoutsThisMonth.reduce((s, b) => s + b.amount, 0);
+
+  // compare to last month for a simple trend signal
+  const now = new Date();
+  const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const lastMKey = monthKey(lastMonthDate);
+  const bailoutsLastMonth = state.bailouts.filter((b) => b.monthKey === lastMKey);
+  const totalLastMonth = bailoutsLastMonth.reduce((s, b) => s + b.amount, 0);
+  const improving = totalThisMonth < totalLastMonth;
+  const hasComparison = bailoutsLastMonth.length > 0 || bailoutsThisMonth.length > 0;
+
+  const BUCKET_OPTIONS = [
+    { key: "checking", label: "Checking" },
+    { key: "savings", label: "Savings" },
+    { key: "bills", label: "Bills" },
+    { key: "tax", label: "Taxes" },
+    { key: "slush", label: "Slush fund" },
+    { key: "stss", label: "STSS" },
+  ];
+
+  function logBailout() {
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0 || fromBucket === toBucket) return;
+    update((s) => {
+      const newBuckets = { ...s.buckets };
+      newBuckets[fromBucket] = round2((newBuckets[fromBucket] || 0) - amt);
+      newBuckets[toBucket] = round2((newBuckets[toBucket] || 0) + amt);
+      return {
+        ...s,
+        buckets: newBuckets,
+        bailouts: [
+          ...s.bailouts,
+          {
+            id: uid("bail"),
+            fromBucket,
+            toBucket,
+            amount: amt,
+            reason: reason.trim(),
+            date: todayISO(),
+            monthKey: mKey,
+          },
+        ],
+      };
+    });
+    setAmount("");
+    setReason("");
+  }
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Move this money in your real accounts">To Do</SectionTitle>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Waiting on you</div>
+        {pending.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing pending right now.</div>
+        ) : (
+          <Ledger>
+            {pending.map((t) => (
+              <TransferRow
+                key={t.id}
+                t={t}
+                right={
+                  <Button
+                    variant="subtle"
+                    style={{ padding: "5px 10px", fontSize: 12 }}
+                    onClick={() =>
+                      update((s) => ({
+                        ...s,
+                        transfers: s.transfers.map((x) => (x.id === t.id ? { ...x, done: true } : x)),
+                      }))
+                    }
+                  >
+                    Mark done
+                  </Button>
+                }
+              />
+            ))}
+          </Ledger>
+        )}
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10, color: "#8B96A3" }}>
+          Completed
+        </div>
+        {done.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>None yet.</div>
+        ) : (
+          <Ledger>
+            {done
+              .slice()
+              .reverse()
+              .slice(0, 10)
+              .map((t) => <TransferRow key={t.id} t={t} />)}
+          </Ledger>
+        )}
+      </Card>
+
+      <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12, marginTop: 8 }}>
+        Bailout transfers
+      </div>
+      <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14 }}>
+        For moving money between buckets to cover a surprise shortfall — tracked separately so
+        you can see the pattern and work toward needing fewer of these.
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 16, marginBottom: 20 }}>
+        <div
+          style={{
+            background: totalThisMonth > 0 ? "#F3E3DC" : "#EDE9DC",
+            borderRadius: 8,
+            padding: "14px 16px",
+          }}
+        >
+          <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>This month</div>
+          <div
+            style={{
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: 22,
+              fontWeight: 500,
+              color: totalThisMonth > 0 ? "#8A3C28" : "#1C2B3A",
+            }}
+          >
+            {fmt(totalThisMonth)}
+          </div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginTop: 2 }}>
+            across {bailoutsThisMonth.length} transfer{bailoutsThisMonth.length === 1 ? "" : "s"}
+          </div>
+        </div>
+        <div style={{ background: "#EDE9DC", borderRadius: 8, padding: "14px 16px" }}>
+          <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>Vs. last month</div>
+          {hasComparison ? (
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 22, fontWeight: 500, color: "#1C2B3A" }}>
+                {fmt(totalLastMonth)}
+              </span>
+              {totalThisMonth !== totalLastMonth && (
+                <Pill tone={improving ? "good" : "warn"}>
+                  {improving ? "Trending down" : "Trending up"}
+                </Pill>
+              )}
+            </div>
+          ) : (
+            <div style={{ fontSize: 13, color: "#8B96A3" }}>No data yet to compare.</div>
+          )}
+        </div>
+      </div>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Log a bailout transfer</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>From</div>
+            <select
+              value={fromBucket}
+              onChange={(e) => setFromBucket(e.target.value)}
+              style={{ fontFamily: "Inter, sans-serif", fontSize: 14, padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A" }}
+            >
+              {BUCKET_OPTIONS.map((b) => (
+                <option key={b.key} value={b.key}>{b.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>To</div>
+            <select
+              value={toBucket}
+              onChange={(e) => setToBucket(e.target.value)}
+              style={{ fontFamily: "Inter, sans-serif", fontSize: 14, padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A" }}
+            >
+              {BUCKET_OPTIONS.map((b) => (
+                <option key={b.key} value={b.key}>{b.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Amount</div>
+            <Input
+              type="number"
+              placeholder="0.00"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              style={{ width: 100 }}
+            />
+          </div>
+          <div style={{ flex: 1, minWidth: 160 }}>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>What happened</div>
+            <Input
+              placeholder="e.g. car repair, grocery overrun"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              style={{ width: "100%" }}
+            />
+          </div>
+          <Button onClick={logBailout}>Log it</Button>
+        </div>
+        {fromBucket === toBucket && (
+          <div style={{ fontSize: 12, color: "#8A3C28", marginTop: 8 }}>
+            Pick two different accounts.
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Bailout history</div>
+        {state.bailouts.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>
+            None logged yet — hopefully it stays that way.
+          </div>
+        ) : (
+          <Ledger>
+            {state.bailouts
+              .slice()
+              .reverse()
+              .slice(0, 20)
+              .map((b) => (
+                <LedgerRow
+                  key={b.id}
+                  label={`${ACCOUNT_DISPLAY_NAMES[b.fromBucket] || b.fromBucket} → ${ACCOUNT_DISPLAY_NAMES[b.toBucket] || b.toBucket}`}
+                  sub={`${formatLocalDate(b.date)}${b.reason ? " · " + b.reason : ""}`}
+                  amount={b.amount}
+                  accent="#8A3C28"
+                />
+              ))}
+          </Ledger>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ---------- Alerts View ---------- */
+function AlertsView({ state, update }) {
+  const pace = checkPaceAlert(state);
+  const [customLabel, setCustomLabel] = useState("");
+  const [expandedRequests, setExpandedRequests] = useState({}); // { [limId]: boolean }
+  const [importError, setImportError] = useState("");
+  const [importedOk, setImportedOk] = useState(false);
+
+  function exportData() {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ledger-backup-${todayISO()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function importData(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImportError("");
+    setImportedOk(false);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        if (typeof parsed !== "object" || parsed === null) throw new Error("not an object");
+        update({ ...initialState, ...parsed });
+        setImportedOk(true);
+      } catch (err) {
+        setImportError("That file doesn't look like a valid backup — couldn't read it.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Stay ahead of trouble">Alerts</SectionTitle>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Move data between devices</div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14, maxWidth: 460 }}>
+          Download everything in this app as a single file, then import that same file on another
+          device's copy of the app to bring your data over.
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <Button variant="subtle" onClick={exportData}>
+            Export data
+          </Button>
+          <label
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              padding: "8px 14px",
+              borderRadius: 6,
+              border: "1px solid #D8D2C2",
+              background: "#FFFEFB",
+              color: "#1C2B3A",
+              fontSize: 13.5,
+              fontWeight: 500,
+              cursor: "pointer",
+            }}
+          >
+            Import data
+            <input type="file" accept="application/json" onChange={importData} style={{ display: "none" }} />
+          </label>
+        </div>
+        {importError && (
+          <div style={{ fontSize: 12.5, color: "#8A3C28", marginTop: 10 }}>{importError}</div>
+        )}
+        {importedOk && (
+          <div style={{ fontSize: 12.5, color: "#3B5C40", marginTop: 10 }}>
+            Imported successfully — your data here now matches the file.
+          </div>
+        )}
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Weekly money date</div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14, maxWidth: 420 }}>
+          A heads-up banner 30 minutes before your recurring check-in time.
+        </div>
+        <MoneyDateControls moneyDate={state.moneyDate} update={update} />
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontWeight: 500, fontSize: 14.5 }}>Income pace alert</div>
+            <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 2, maxWidth: 420 }}>
+              Fires as soon as income logged this month falls behind your monthly projection's
+              pace, or behind what bills and budgets due so far require.
+            </div>
+          </div>
+          <Toggle
+            checked={state.alerts.paceAlertOn}
+            onChange={(v) =>
+              update((s) => ({ ...s, alerts: { ...s.alerts, paceAlertOn: v } }))
+            }
+          />
+        </div>
+        {state.alerts.paceAlertOn && (
+          <div
+            style={{
+              marginTop: 12,
+              paddingTop: 12,
+              borderTop: "1px solid #E3DDC9",
+              fontSize: 12.5,
+              color: pace.fires ? "#8A3C28" : "#3B5C40",
+            }}
+          >
+            {pace.fires
+              ? `Currently firing — logged ${fmt(pace.incomeThisMonth)} vs. ${fmt(pace.expectedByNow)} expected by today.`
+              : `Currently on pace — logged ${fmt(pace.incomeThisMonth)} vs. ${fmt(pace.expectedByNow)} expected by today.`}
+          </div>
+        )}
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontWeight: 500, fontSize: 14.5 }}>Spending ahead of pace</div>
+            <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 2, maxWidth: 420 }}>
+              Flags any budget category (groceries, gas, eating out) running hotter than the
+              day of the month would suggest.
+            </div>
+          </div>
+          <Toggle
+            checked={state.alerts.spendingPaceAlertOn}
+            onChange={(v) =>
+              update((s) => ({ ...s, alerts: { ...s.alerts, spendingPaceAlertOn: v } }))
+            }
+          />
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontWeight: 500, fontSize: 14.5 }}>Bill paid on time</div>
+            <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 2, maxWidth: 420 }}>
+              A quick celebratory banner whenever you check off a bill on or before its due date.
+            </div>
+          </div>
+          <Toggle
+            checked={state.alerts.billWinAlertOn}
+            onChange={(v) =>
+              update((s) => ({ ...s, alerts: { ...s.alerts, billWinAlertOn: v } }))
+            }
+          />
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontWeight: 500, fontSize: 14.5 }}>Weekly projection</div>
+            <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 2, maxWidth: 420 }}>
+              A standing card on the Dashboard showing this week's upcoming bills and what's left
+              available in checking after they're covered.
+            </div>
+          </div>
+          <Toggle
+            checked={state.alerts.weeklyProjectionAlertOn}
+            onChange={(v) =>
+              update((s) => ({ ...s, alerts: { ...s.alerts, weeklyProjectionAlertOn: v } }))
+            }
+          />
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 6 }}>Custom alerts</div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 12 }}>
+          A simple place to note your own rules for now — a full rule builder can come later.
+        </div>
+        {state.alerts.custom.length > 0 && (
+          <Ledger>
+            {state.alerts.custom.map((c) => (
+              <LedgerRow
+                key={c.id}
+                label={c.label}
+                right={
+                  <Toggle
+                    checked={c.on}
+                    onChange={(v) =>
+                      update((s) => ({
+                        ...s,
+                        alerts: {
+                          ...s.alerts,
+                          custom: s.alerts.custom.map((x) =>
+                            x.id === c.id ? { ...x, on: v } : x
+                          ),
+                        },
+                      }))
+                    }
+                  />
+                }
+              />
+            ))}
+          </Ledger>
+        )}
+        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+          <Input
+            placeholder="e.g. Warn me if eating out exceeds $40/week"
+            value={customLabel}
+            onChange={(e) => setCustomLabel(e.target.value)}
+            style={{ flex: 1 }}
+          />
+          <Button
+            variant="subtle"
+            onClick={() => {
+              if (!customLabel) return;
+              update((s) => ({
+                ...s,
+                alerts: {
+                  ...s.alerts,
+                  custom: [...s.alerts.custom, { id: uid("alert"), label: customLabel, on: true }],
+                },
+              }));
+              setCustomLabel("");
+            }}
+          >
+            Add note
+          </Button>
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 6 }}>
+          Feature requests
+        </div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14 }}>
+          A running record of things you've asked for that aren't actually possible from inside
+          this app, along with what it would take to get there for real. Tap one to expand.
+        </div>
+        {state.knownLimitations.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing on this list.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {state.knownLimitations.map((lim) => {
+              const isOpen = !!expandedRequests[lim.id];
+              return (
+                <div
+                  key={lim.id}
+                  style={{
+                    border: "1px solid #E3DDC9",
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                  }}
+                >
+                  <div
+                    onClick={() => setExpandedRequests((e) => ({ ...e, [lim.id]: !e[lim.id] }))}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <span style={{ fontWeight: 500, fontSize: 13.5, color: "#1C2B3A" }}>
+                      {lim.request}
+                    </span>
+                    <i
+                      className={`ti ti-chevron-${isOpen ? "up" : "down"}`}
+                      style={{ fontSize: 16, color: "#8B96A3", flexShrink: 0 }}
+                      aria-hidden="true"
+                    />
+                  </div>
+                  {isOpen && (
+                    <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #E3DDC9" }}>
+                      <div style={{ fontSize: 12.5, color: "#8A3C28", marginBottom: 6, lineHeight: 1.5 }}>
+                        <span style={{ fontWeight: 500 }}>Why not: </span>
+                        {lim.why}
+                      </div>
+                      <div style={{ fontSize: 12.5, color: "#3B5C40", lineHeight: 1.5 }}>
+                        <span style={{ fontWeight: 500 }}>Real path there: </span>
+                        {lim.solution}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function Toggle({ checked, onChange }) {
+  return (
+    <div
+      onClick={() => onChange(!checked)}
+      style={{
+        width: 38,
+        height: 22,
+        borderRadius: 12,
+        background: checked ? "#6B8F71" : "#D8D2C2",
+        position: "relative",
+        cursor: "pointer",
+        flexShrink: 0,
+        transition: "background 0.15s",
+      }}
+    >
+      <div
+        style={{
+          width: 16,
+          height: 16,
+          borderRadius: "50%",
+          background: "#FFFEFB",
+          position: "absolute",
+          top: 3,
+          left: checked ? 19 : 3,
+          transition: "left 0.15s",
+        }}
+      />
+    </div>
+  );
+}
+
+/* shared editable controls for the weekly money date — used in both the Setup
+   wizard and the Alerts tab, since the person asked for it to be adjustable
+   in both places without duplicating the UI. */
+function MoneyDateControls({ moneyDate, update }) {
+  const selectStyle = {
+    fontFamily: "Inter, sans-serif",
+    fontSize: 14,
+    padding: "8px 10px",
+    borderRadius: 6,
+    border: "1px solid #D8D2C2",
+    background: "#FFFEFB",
+    color: "#1C2B3A",
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ fontSize: 13.5, fontWeight: 500, color: "#1C2B3A" }}>Enable money date reminder</span>
+        <Toggle
+          checked={moneyDate.enabled}
+          onChange={(v) => update((s) => ({ ...s, moneyDate: { ...s.moneyDate, enabled: v } }))}
+        />
+      </div>
+      {moneyDate.enabled && (
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Day</div>
+            <select
+              value={moneyDate.dayOfWeek}
+              onChange={(e) =>
+                update((s) => ({ ...s, moneyDate: { ...s.moneyDate, dayOfWeek: parseInt(e.target.value) } }))
+              }
+              style={selectStyle}
+            >
+              {DAY_NAMES.map((name, i) => (
+                <option key={i} value={i}>{name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Time</div>
+            <Input
+              type="time"
+              value={moneyDate.time}
+              onChange={(e) =>
+                update((s) => ({ ...s, moneyDate: { ...s.moneyDate, time: e.target.value } }))
+              }
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Setup wizard ----------
+   Builds this month's history first (income, invoices, bills, spending), running each
+   item through the same allocation/conversion logic as normal data entry, so the bucket
+   math arrives at a realistic state. Only at the very end does the person enter their
+   actual current account balances — which simply overwrite whatever the simulation
+   produced, since the real bank balance is ground truth. */
+const SETUP_STEPS = [
+  { id: "projection", title: "Monthly income projection" },
+  { id: "paychecks", title: "Paychecks logged this month" },
+  { id: "invoices", title: "Invoices" },
+  { id: "bills", title: "Bills this month" },
+  { id: "spending", title: "Additional spending" },
+  { id: "balances", title: "Current account balances" },
+  { id: "moneydate", title: "Weekly money date" },
+];
+
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function SetupWizard({ state, update, isMobile, onFinish }) {
+  // all wizard progress lives in state.setupDraft so it survives closing and reopening
+  // the app — every setter below writes through `update`, same pattern as the rest
+  // of the app, rather than local component state that would vanish on unmount.
+  const draft = state.setupDraft;
+
+  function patchDraft(patch) {
+    update((s) => ({ ...s, setupDraft: { ...s.setupDraft, ...patch } }));
+  }
+
+  const step = draft.step;
+  const setStep = (n) => patchDraft({ step: n });
+  const projection = draft.projection;
+  const setProjection = (v) => patchDraft({ projection: v });
+  const draftPaychecks = draft.draftPaychecks;
+  const setDraftPaychecks = (fn) =>
+    patchDraft({ draftPaychecks: typeof fn === "function" ? fn(draft.draftPaychecks) : fn });
+  const draftInvoices = draft.draftInvoices;
+  const setDraftInvoices = (fn) =>
+    patchDraft({ draftInvoices: typeof fn === "function" ? fn(draft.draftInvoices) : fn });
+  const draftBillsPaid = draft.draftBillsPaid;
+  const setDraftBillsPaid = (fn) =>
+    patchDraft({ draftBillsPaid: typeof fn === "function" ? fn(draft.draftBillsPaid) : fn });
+  const draftSpending = draft.draftSpending;
+  const setDraftSpending = (fn) =>
+    patchDraft({ draftSpending: typeof fn === "function" ? fn(draft.draftSpending) : fn });
+  const balances = draft.balances;
+  const setBalances = (fn) =>
+    patchDraft({ balances: typeof fn === "function" ? fn(draft.balances) : fn });
+
+  const mKey = monthKey();
+  const stepInfo = SETUP_STEPS[step];
+
+  function goNext() {
+    if (step < SETUP_STEPS.length - 1) setStep(step + 1);
+  }
+  function goBack() {
+    if (step > 0) setStep(step - 1);
+  }
+
+  /* runs all drafted history through the same engines used elsewhere in the app,
+     building up income/transfers/buckets in order, then overwrites the resulting
+     balances with whatever was entered in the final step. */
+  function commitSetup() {
+    update((s) => {
+      let working = { ...s, monthlyIncomeProjection: projection };
+
+      // 1. paychecks — each runs through allocateIncome, same as the Income tab
+      draftPaychecks.forEach((p) => {
+        const entry = {
+          id: uid("inc"),
+          date: p.date,
+          amount: round2(parseFloat(p.amount) || 0),
+          type: p.type,
+          monthKey: monthKey(parseLocalDate(p.date)),
+        };
+        if (entry.amount <= 0) return;
+        const moves = allocateIncome(entry, working);
+        const newBuckets = { ...working.buckets };
+        const newTransfers = [...working.transfers];
+        moves.forEach((m) => {
+          newBuckets[m.bucket] = round2((newBuckets[m.bucket] || 0) + m.amount);
+          if (m.bucket === "savings" || m.bucket === "tax" || m.bucket === "bills") {
+            newTransfers.push({
+              id: uid("xfer"),
+              fromAccount: "Checking",
+              toAccount: ACCOUNT_DISPLAY_NAMES[m.bucket] || m.bucket,
+              amount: m.amount,
+              note: m.note,
+              target: m.bucket,
+              done: !!m.alreadyDeducted,
+              createdAt: entry.date,
+              monthKey: entry.monthKey,
+            });
+          }
+        });
+        working = { ...working, income: [...working.income, entry], buckets: newBuckets, transfers: newTransfers };
+      });
+
+      // 2. invoices — unpaid ones just get added; paid ones convert to income via the
+      //    same conversion function used on the Invoices tab (always freelance, dated today
+      //    for the income entry, but keeping their real issue date on the invoice record)
+      draftInvoices.forEach((inv) => {
+        const amount = round2(parseFloat(inv.amount) || 0);
+        if (!inv.description || amount <= 0) return;
+        const invoiceRecord = {
+          id: uid("inv"),
+          description: inv.description,
+          amount,
+          issueDate: inv.issueDate,
+          status: "unpaid",
+          paidDate: null,
+          incomeId: null,
+        };
+        working = { ...working, invoices: [...working.invoices, invoiceRecord] };
+        if (inv.status === "paid") {
+          working = convertInvoiceToIncome(working, invoiceRecord.id);
+        }
+      });
+
+      // 3. bills — mark drafted ones paid for this month, same as the checkbox elsewhere
+      Object.keys(draftBillsPaid).forEach((billId) => {
+        if (draftBillsPaid[billId]) {
+          working = markBillPaid(working, billId);
+        }
+      });
+
+      // 4. additional category spending
+      const newSpending = [...working.spending];
+      draftSpending.forEach((sp) => {
+        const amount = round2(parseFloat(sp.amount) || 0);
+        if (!sp.category || amount <= 0) return;
+        newSpending.push({
+          id: uid("sp"),
+          category: sp.category,
+          description: sp.description ? sp.description.trim() : "",
+          amount,
+          date: sp.date,
+          monthKey: monthKey(parseLocalDate(sp.date)),
+          tags: parseTags(sp.tags),
+        });
+      });
+      working = { ...working, spending: newSpending };
+
+      // recompute slush/STSS split now that the full month's drafted history is in
+      const split = computeMonthlySplit(working, mKey);
+      working = {
+        ...working,
+        buckets: { ...working.buckets, slush: split.slushAdd, stss: split.stssAdd },
+      };
+
+      // 5. final step: actual balances overwrite whatever the simulation produced —
+      // the real bank balance is ground truth, not the simulated one
+      working = {
+        ...working,
+        buckets: {
+          ...working.buckets,
+          checking: round2(parseFloat(balances.checking) || 0),
+          savings: round2(parseFloat(balances.savings) || 0),
+          bills: round2(parseFloat(balances.bills) || 0),
+          tax: round2(parseFloat(balances.tax) || 0),
+          slush: round2(parseFloat(balances.slush) || 0),
+          stss: round2(parseFloat(balances.stss) || 0),
+        },
+        setupCompleted: true,
+        // clear the draft now that it's been committed, so a future re-entry into
+        // Setup (via the nav) starts fresh rather than replaying old history
+        setupDraft: initialState.setupDraft,
+      };
+
+      return working;
+    });
+    onFinish();
+  }
+
+  return (
+    <div>
+      <SectionTitle eyebrow={`Step ${step + 1} of ${SETUP_STEPS.length}`}>{stepInfo.title}</SectionTitle>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, fontSize: 12, color: "#8B96A3" }}>
+        <i className="ti ti-device-floppy" style={{ fontSize: 13 }} aria-hidden="true" />
+        Your progress saves automatically — close this any time and pick back up later.
+      </div>
+
+      <div style={{ display: "flex", gap: 4, marginBottom: 20, marginTop: 10, flexWrap: "wrap" }}>
+        {SETUP_STEPS.map((st, i) => (
+          <div
+            key={st.id}
+            onClick={() => setStep(i)}
+            style={{
+              flex: isMobile ? "0 0 auto" : 1,
+              height: 4,
+              borderRadius: 2,
+              background: i <= step ? "#1C2B3A" : "#E3DDC9",
+              cursor: "pointer",
+              minWidth: isMobile ? 28 : undefined,
+            }}
+          />
+        ))}
+      </div>
+
+      {step === 0 && (
+        <Card style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 12 }}>
+            What do you expect to bring in this month, in total? This is used to track pace
+            against your income as the month goes on.
+          </div>
+          <Input
+            type="number"
+            value={projection}
+            onChange={(e) => setProjection(parseFloat(e.target.value) || 0)}
+            style={{ width: 140 }}
+          />
+        </Card>
+      )}
+
+      {step === 1 && (
+        <PaycheckDraftStep drafts={draftPaychecks} setDrafts={setDraftPaychecks} />
+      )}
+
+      {step === 2 && (
+        <InvoiceDraftStep drafts={draftInvoices} setDrafts={setDraftInvoices} />
+      )}
+
+      {step === 3 && (
+        <BillsDraftStep bills={state.bills} draftPaid={draftBillsPaid} setDraftPaid={setDraftBillsPaid} />
+      )}
+
+      {step === 4 && (
+        <SpendingDraftStep
+          budgets={state.budgets}
+          drafts={draftSpending}
+          setDrafts={setDraftSpending}
+          knownTags={Array.from(
+            new Set(
+              state.spending.flatMap((sp) => (sp.tags && sp.tags.length ? sp.tags : sp.tag ? [sp.tag] : []))
+            )
+          )}
+        />
+      )}
+
+      {step === 5 && (
+        <Card>
+          <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 14 }}>
+            Last step — enter your real current balances. These overwrite anything the history
+            above would otherwise add up to, since your actual bank balance is what matters.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(3, 1fr)", gap: 14 }}>
+            {[
+              { key: "checking", label: "Checking" },
+              { key: "savings", label: "Savings" },
+              { key: "bills", label: "Bills" },
+              { key: "tax", label: "Taxes" },
+              { key: "slush", label: "Slush fund" },
+              { key: "stss", label: "STSS (goals)" },
+            ].map((f) => (
+              <div key={f.key}>
+                <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>{f.label}</div>
+                <Input
+                  type="number"
+                  value={balances[f.key] || state.buckets[f.key] || 0}
+                  onChange={(e) =>
+                    setBalances((b) => ({ ...b, [f.key]: e.target.value }))
+                  }
+                  style={{ width: "100%" }}
+                />
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {step === 6 && (
+        <Card>
+          <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 14 }}>
+            A recurring weekly time to check in on your finances together. You'll get a heads-up
+            banner in the app 30 minutes before. You can change this any time from the Alerts tab.
+          </div>
+          <MoneyDateControls moneyDate={state.moneyDate} update={update} />
+        </Card>
+      )}
+
+      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 24 }}>
+        <Button variant="ghost" onClick={goBack} style={{ visibility: step === 0 ? "hidden" : "visible" }}>
+          Back
+        </Button>
+        {step < SETUP_STEPS.length - 1 ? (
+          <Button onClick={goNext}>Next</Button>
+        ) : (
+          <Button onClick={commitSetup}>Finish setup</Button>
+        )}
+      </div>
+
+      {state.setupCompleted && (
+        <div style={{ marginTop: 20, textAlign: "center" }}>
+          <span
+            onClick={onFinish}
+            style={{ fontSize: 12.5, color: "#8B96A3", cursor: "pointer" }}
+          >
+            Cancel and return to dashboard
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PaycheckDraftStep({ drafts, setDrafts }) {
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [type, setType] = useState("regular");
+
+  function add() {
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) return;
+    setDrafts((d) => [...d, { id: uid("draft"), amount, date, type }]);
+    setAmount("");
+  }
+  function remove(id) {
+    setDrafts((d) => d.filter((x) => x.id !== id));
+  }
+
+  return (
+    <Card style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 12 }}>
+        Add each paycheck or freelance payment you've already received this month, with the date
+        it landed. For regular paychecks, enter the amount that hit checking.
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+        <Input type="number" placeholder="Amount" value={amount} onChange={(e) => setAmount(e.target.value)} style={{ width: 110 }} />
+        <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        <select
+          value={type}
+          onChange={(e) => setType(e.target.value)}
+          style={{ fontFamily: "Inter, sans-serif", fontSize: 14, padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A" }}
+        >
+          <option value="regular">Regular</option>
+          <option value="freelance">Freelance</option>
+        </select>
+        <Button variant="subtle" onClick={add}>Add</Button>
+      </div>
+      {drafts.length === 0 ? (
+        <div style={{ fontSize: 13, color: "#8B96A3" }}>None added yet — that's fine if this is your first paycheck of the month.</div>
+      ) : (
+        <Ledger>
+          {drafts.map((d) => (
+            <LedgerRow
+              key={d.id}
+              label={d.type === "freelance" ? "Freelance income" : "Regular income"}
+              sub={formatLocalDate(d.date)}
+              amount={parseFloat(d.amount) || 0}
+              right={
+                <span onClick={() => remove(d.id)} style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}>
+                  Remove
+                </span>
+              }
+            />
+          ))}
+        </Ledger>
+      )}
+    </Card>
+  );
+}
+
+function InvoiceDraftStep({ drafts, setDrafts }) {
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
+  const [issueDate, setIssueDate] = useState(todayISO());
+  const [status, setStatus] = useState("unpaid");
+
+  function add() {
+    const amt = parseFloat(amount);
+    if (!description || !amt || amt <= 0) return;
+    setDrafts((d) => [...d, { id: uid("draft"), description, amount, issueDate, status }]);
+    setDescription("");
+    setAmount("");
+  }
+  function remove(id) {
+    setDrafts((d) => d.filter((x) => x.id !== id));
+  }
+
+  return (
+    <Card style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 12 }}>
+        Add any invoices relevant to this month — both ones you're still waiting on, and ones
+        already paid. Paid ones will be converted into freelance income automatically.
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+        <Input placeholder="Description" value={description} onChange={(e) => setDescription(e.target.value)} style={{ width: 200 }} />
+        <Input type="number" placeholder="Amount" value={amount} onChange={(e) => setAmount(e.target.value)} style={{ width: 100 }} />
+        <Input type="date" value={issueDate} onChange={(e) => setIssueDate(e.target.value)} />
+        <select
+          value={status}
+          onChange={(e) => setStatus(e.target.value)}
+          style={{ fontFamily: "Inter, sans-serif", fontSize: 14, padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A" }}
+        >
+          <option value="unpaid">Unpaid</option>
+          <option value="paid">Already paid</option>
+        </select>
+        <Button variant="subtle" onClick={add}>Add</Button>
+      </div>
+      {drafts.length === 0 ? (
+        <div style={{ fontSize: 13, color: "#8B96A3" }}>No invoices yet — skip ahead if this doesn't apply to you.</div>
+      ) : (
+        <Ledger>
+          {drafts.map((d) => (
+            <LedgerRow
+              key={d.id}
+              label={d.description}
+              sub={`Issued ${formatLocalDate(d.issueDate)} · ${d.status}`}
+              amount={parseFloat(d.amount) || 0}
+              right={
+                <span onClick={() => remove(d.id)} style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}>
+                  Remove
+                </span>
+              }
+            />
+          ))}
+        </Ledger>
+      )}
+    </Card>
+  );
+}
+
+function BillsDraftStep({ bills, draftPaid, setDraftPaid }) {
+  return (
+    <Card style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 12 }}>
+        Check off any of your recurring bills that you've already paid so far this month.
+      </div>
+      <Ledger>
+        {[...bills].sort((a, b) => a.day - b.day).map((b) => (
+          <LedgerRow
+            key={b.id}
+            label={b.name}
+            sub={`Due on the ${ordinal(b.day)}`}
+            amount={b.amount}
+            right={
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#1C2B3A", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={!!draftPaid[b.id]}
+                  onChange={() => setDraftPaid((d) => ({ ...d, [b.id]: !d[b.id] }))}
+                />
+                Already paid
+              </label>
+            }
+          />
+        ))}
+      </Ledger>
+    </Card>
+  );
+}
+
+function SpendingDraftStep({ budgets, drafts, setDrafts, knownTags }) {
+  const categoryOptions = [
+    ...Object.entries(budgets).map(([key, b]) => ({ key, label: b.label })),
+    { key: "other", label: "Other" },
+  ];
+
+  const [category, setCategory] = useState(categoryOptions[0].key);
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [tags, setTags] = useState("");
+
+  function categoryLabel(key) {
+    return categoryOptions.find((c) => c.key === key)?.label || key;
+  }
+
+  function add() {
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) return;
+    setDrafts((d) => [...d, { id: uid("draft"), category, description, amount, date, tags }]);
+    setDescription("");
+    setAmount("");
+    setTags("");
+  }
+  function remove(id) {
+    setDrafts((d) => d.filter((x) => x.id !== id));
+  }
+
+  return (
+    <Card style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 12 }}>
+        Add any groceries, gas, eating-out, or other spending from earlier this month that you
+        want reflected in your budgets.
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+        <select
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+          style={{ fontFamily: "Inter, sans-serif", fontSize: 14, padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A" }}
+        >
+          {categoryOptions.map((c) => (
+            <option key={c.key} value={c.key}>{c.label}</option>
+          ))}
+        </select>
+        <Input
+          placeholder="Description"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          style={{ width: 160 }}
+        />
+        <Input type="number" placeholder="Amount" value={amount} onChange={(e) => setAmount(e.target.value)} style={{ width: 100 }} />
+        <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        <TagInput
+          placeholder="Tags, comma separated"
+          knownTags={knownTags}
+          value={tags}
+          onChange={(val) => setTags(val)}
+          style={{ width: 180 }}
+        />
+        <Button variant="subtle" onClick={add}>Add</Button>
+      </div>
+      {drafts.length === 0 ? (
+        <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing added yet — that's fine if you're starting fresh.</div>
+      ) : (
+        <Ledger>
+          {drafts.map((d) => (
+            <LedgerRow
+              key={d.id}
+              label={d.description ? d.description : categoryLabel(d.category)}
+              sub={`${categoryLabel(d.category)} · ${formatLocalDate(d.date)}${d.tags ? " · " + d.tags : ""}`}
+              amount={parseFloat(d.amount) || 0}
+              right={
+                <span onClick={() => remove(d.id)} style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}>
+                  Remove
+                </span>
+              }
+            />
+          ))}
+        </Ledger>
+      )}
+    </Card>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<BudgetApp />);
+</script>
+</body>
+</html>
