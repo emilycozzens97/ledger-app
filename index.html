@@ -47,6 +47,20 @@
   }, 6000);
 </script>
 
+<script>
+  // Suppresses Babel's "you are using the in-browser transformer" console notice —
+  // expected and harmless here since this file intentionally has no build step,
+  // but silencing it keeps the console clean for anyone inspecting it.
+  if (window.Babel && window.Babel.registerPreset) {
+    var originalWarn = console.warn;
+    console.warn = function () {
+      var msg = arguments[0];
+      if (typeof msg === 'string' && msg.indexOf('in-browser Babel transformer') !== -1) return;
+      return originalWarn.apply(console, arguments);
+    };
+  }
+</script>
+
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useCallback, useMemo } = React;
 
@@ -70,13 +84,7 @@ async function saveState(state) {
 }
 
 /* ---------- defaults ---------- */
-const DEFAULT_BILLS = [
-  { id: "b1", name: "Progressive insurance", amount: 85, day: 3, paid: false, paidMonthKey: null },
-  { id: "b2", name: "Boost mobile", amount: 27, day: 14, paid: false, paidMonthKey: null },
-  { id: "b3", name: "BeyondFinance", amount: 432.76, day: 18, paid: false, paidMonthKey: null },
-  { id: "b4", name: "Spotify", amount: 14.06, day: 20, paid: false, paidMonthKey: null },
-  { id: "b5", name: "VASA fitness", amount: 27.98, day: 20, paid: false, paidMonthKey: null },
-];
+const DEFAULT_BILLS = [];
 
 const DEFAULT_BUDGETS = {
   groceries: { label: "Groceries", monthly: 400 },
@@ -126,12 +134,16 @@ function uid(prefix = "id") {
 const initialState = {
   bills: DEFAULT_BILLS,
   budgets: DEFAULT_BUDGETS,
-  income: [], // { id, date, amount, type: 'regular'|'freelance', monthKey }
-  spending: [], // { id, date, category, amount, monthKey, tags: string[], description? }
+  income: [], // { id, date, amount, type: 'regular' (displayed as W-2)|'freelance', monthKey }
+  spending: [], // { id, date, category, amount, monthKey, tags: string[], description?, status }
   goals: [], // { id, name, cost, hasDeadline, deadline, status: 'wishlist'|'active', weeklyOverride }
   transfers: [], // { id, label, amount, target, done, createdAt, monthKey }
-  bailouts: [], // { id, fromBucket, toBucket, amount, reason, date, monthKey }
-  buckets: { savings: 0, tax: 0, slush: 0, stss: 0, bills: 0, checking: 0 },
+  bailouts: [], // { id, fromBucket, toBucket, amount, reason, date, monthKey, status, postedDate }
+  buckets: { savings: 0, tax: 0, slush: 0, stss: 0, bills: 0, checking: 0, sinkingFund: 0 },
+  // how leftover (after bills allocation) splits between slush, stss, and sinking fund.
+  // must sum to 100. sinkingFund defaults to 0 so existing behavior is unchanged.
+  leftoverSplit: { slush: 50, stss: 50, sinkingFund: 0 },
+  irregularExpenses: [], // { id, name, amount, dueDate, paid, paidDate, notes }
   alerts: {
     paceAlertOn: true,
     spendingPaceAlertOn: true,
@@ -151,10 +163,11 @@ const initialState = {
     draftInvoices: [],
     draftBillsPaid: {},
     draftSpending: [],
-    balances: { checking: 0, savings: 0, bills: 0, tax: 0, slush: 0, stss: 0 },
+    balances: { checking: 0, savings: 0, bills: 0, tax: 0, slush: 0, stss: 0, sinkingFund: 0 },
   },
   moneyDate: { enabled: false, dayOfWeek: 0, time: "18:00" }, // dayOfWeek: 0=Sun..6=Sat
   lastWin: null, // { billName, id, at } — transient, cleared after the Dashboard shows it
+  retroDismissedMonthKey: null, // tracks which month's bailout retro has been seen/dismissed
   shoppingList: [], // { id, name, checked }
   knownLimitations: [
     {
@@ -229,6 +242,29 @@ function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
+/* rounds an amount up to the nearest increment (e.g. 5 or 10) — used to pad bills
+   with a small built-in cushion that just sits in the Bills bucket as buffer. */
+function roundUpTo(amount, increment) {
+  if (!increment || increment <= 0) return amount;
+  return Math.ceil(amount / increment) * increment;
+}
+
+/* Shared three-stage status model used across bills, transfers, invoices, income,
+   and spending — represents the gap between "I've recorded/committed this" and
+   "this has actually posted to the real account." Only items in the final settled
+   stage (Paid/Posted) count as money that's actually moved for bucket math; Pending
+   items are visible for tracking but don't get double-counted as settled. */
+const STATUS = { UNPAID: "unpaid", PENDING: "pending", PAID: "paid" };
+const STATUS_LABELS = { unpaid: "Unpaid", pending: "Pending", paid: "Paid" };
+// for entry types that don't have a meaningful "unpaid" stage (transfers, income,
+// spending — these are logged after the fact, not awaited), pending is the starting
+// point and "posted" is the settled label instead of "paid"
+const STATUS_LABELS_POSTED = { pending: "Pending", paid: "Posted" };
+
+function isSettled(status) {
+  return status === STATUS.PAID;
+}
+
 /* parses a raw comma-separated tag string into a clean array,
    trimming whitespace and dropping empty entries */
 function parseTags(raw) {
@@ -245,27 +281,37 @@ function parseTags(raw) {
 function rolloverBillsIfNewMonth(state) {
   const mKey = monthKey();
   if (state.currentBillsMonthKey === mKey) return state;
-  // new month: reset all bills to unpaid, keep history as-is
+  // new month: reset all bills back to unpaid, keep history as-is
   return {
     ...state,
-    bills: state.bills.map((b) => ({ ...b, paid: false, paidMonthKey: null })),
+    bills: state.bills.map((b) => ({ ...b, status: STATUS.UNPAID, paid: false, paidMonthKey: null })),
     currentBillsMonthKey: mKey,
   };
 }
 
-function markBillPaid(state, billId) {
+/* cycles a bill through Unpaid -> Pending -> Paid -> back to Unpaid.
+   `paid`/`paidMonthKey` are kept in sync as derived fields so existing bucket
+   math (which checks `b.paid`) keeps working unchanged — only the Paid stage
+   counts as settled money for those calculations. */
+function advanceBillStatus(state, billId) {
   const mKey = monthKey();
   const bill = state.bills.find((b) => b.id === billId);
   if (!bill) return state;
 
-  const nowPaid = !bill.paid;
+  const current = bill.status || (bill.paid ? STATUS.PAID : STATUS.UNPAID);
+  const next =
+    current === STATUS.UNPAID ? STATUS.PENDING : current === STATUS.PENDING ? STATUS.PAID : STATUS.UNPAID;
+
   const newBills = state.bills.map((b) =>
-    b.id === billId ? { ...b, paid: nowPaid, paidMonthKey: nowPaid ? mKey : null } : b
+    b.id === billId
+      ? { ...b, status: next, paid: next === STATUS.PAID, paidMonthKey: next === STATUS.PAID ? mKey : null }
+      : b
   );
 
   let newHistory = state.billPaidHistory;
   let lastWin = state.lastWin || null;
-  if (nowPaid) {
+
+  if (next === STATUS.PAID) {
     newHistory = [
       ...state.billPaidHistory,
       {
@@ -282,8 +328,9 @@ function markBillPaid(state, billId) {
     if (bill.day >= dayOfMonth()) {
       lastWin = { billName: bill.name, id: uid("win"), at: Date.now() };
     }
-  } else {
-    // unchecking — remove the most recent matching history entry for this bill/month
+  } else if (current === STATUS.PAID) {
+    // moving away from Paid (cycling back to Unpaid) — remove the most recent
+    // matching history entry for this bill/month
     const idx = newHistory
       .map((h, i) => (h.billId === billId && h.monthKey === mKey ? i : -1))
       .filter((i) => i >= 0)
@@ -332,6 +379,7 @@ function convertInvoiceToIncome(state, invoiceId) {
   const split = computeMonthlySplit(tempState, incomeEntry.monthKey);
   newBuckets.slush = split.slushAdd;
   newBuckets.stss = split.stssAdd;
+  newBuckets.sinkingFund = split.sinkingFundAdd;
 
   const newInvoices = state.invoices.map((i) =>
     i.id === invoiceId
@@ -381,18 +429,27 @@ function computeMonthlySplit(state, mKey) {
   const leftover = afterTaxSavings - totalBills - totalBudgets;
   const usable = Math.max(0, leftover);
 
+  // three-way split: slush / stss / sinking fund, driven by leftoverSplit percentages
+  const split = state.leftoverSplit || { slush: 50, stss: 50, sinkingFund: 0 };
+  const total = (split.slush || 0) + (split.stss || 0) + (split.sinkingFund || 0);
+  const safeTotal = total > 0 ? total : 100;
+  const slushPct = (split.slush || 0) / safeTotal;
+  const stssPct = (split.stss || 0) / safeTotal;
+  const sfPct = (split.sinkingFund || 0) / safeTotal;
+
   return {
     totalIncome,
     freelanceTax,
-    savingsCut, // freelance-only, for "money that left checking" math
-    savingsLoggedTotal: round2(savingsCut + regularSavingsLogged), // for display: all savings, incl. pre-checking $50s
+    savingsCut,
+    savingsLoggedTotal: round2(savingsCut + regularSavingsLogged),
     totalBills,
     paidBillsTotal,
     unpaidBillsTotal: round2(totalBills - paidBillsTotal),
     totalBudgets,
     leftover,
-    slushAdd: round2(usable / 2),
-    stssAdd: round2(usable / 2),
+    slushAdd: round2(usable * slushPct),
+    stssAdd: round2(usable * stssPct),
+    sinkingFundAdd: round2(usable * sfPct),
   };
 }
 
@@ -492,9 +549,42 @@ function buildWeeklyProjection(state) {
     .filter((b) => b.day >= today && b.day <= Math.min(today + 7, totalDays) && !b.paid)
     .sort((a, b) => a.day - b.day);
   const upcomingTotal = upcoming.reduce((s, b) => s + b.amount, 0);
+
+  // irregular expenses due within the next 30 days also show as upcoming
+  const now = new Date(); now.setHours(0,0,0,0);
+  const in30 = new Date(now); in30.setDate(in30.getDate() + 30);
+  const upcomingIrregular = (state.irregularExpenses || []).filter((e) => {
+    if (e.paid) return false;
+    const due = new Date(e.dueDate + "T00:00:00");
+    return due >= now && due <= in30;
+  }).sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+  const irregularTotal = upcomingIrregular.reduce((s, e) => s + e.amount, 0);
+
   const availableFunds = round2((state.buckets.checking || 0) - upcomingTotal);
 
-  return { upcoming, upcomingTotal, availableFunds };
+  return { upcoming, upcomingTotal, availableFunds, upcomingIrregular, irregularTotal };
+}
+
+/* days since the most recent bailout transfer, for the streak counter. null if
+   there's no bailout history yet at all (distinct from "0 days" — never had one
+   is a different, even better, state than "had one today"). */
+function daysSinceLastBailout(state) {
+  if (!state.bailouts || state.bailouts.length === 0) return null;
+  const mostRecent = state.bailouts
+    .map((b) => parseLocalDate(b.date))
+    .sort((a, b) => b - a)[0];
+  const diffMs = new Date().setHours(0, 0, 0, 0) - mostRecent.setHours(0, 0, 0, 0);
+  return Math.max(0, Math.round(diffMs / (1000 * 60 * 60 * 24)));
+}
+
+/* whether this month had any bailouts and the retro hasn't been shown/dismissed
+   for this specific month yet. */
+function checkMonthlyRetro(state) {
+  const mKey = monthKey();
+  const bailoutsThisMonth = state.bailouts.filter((b) => b.monthKey === mKey);
+  if (bailoutsThisMonth.length === 0) return { show: false };
+  if (state.retroDismissedMonthKey === mKey) return { show: false };
+  return { show: true, count: bailoutsThisMonth.length, total: bailoutsThisMonth.reduce((s, b) => s + b.amount, 0) };
 }
 
 /* ---------- UI primitives ---------- */
@@ -760,6 +850,39 @@ const Pill = ({ children, tone = "neutral" }) => {
   );
 };
 
+/* a small clickable status pill that cycles Unpaid -> Pending -> Paid (or
+   Pending -> Posted for entry types with no "unpaid" stage). Click to advance
+   to the next stage. Used everywhere a transaction needs to show where it
+   stands between "recorded" and "actually settled in the real account." */
+const StatusBadge = ({ status, onClick, postedLabel = false }) => {
+  const labels = postedLabel ? STATUS_LABELS_POSTED : STATUS_LABELS;
+  const tones = {
+    unpaid: { bg: "#EDE9DC", fg: "#5F5E5A" },
+    pending: { bg: "#F1E6CC", fg: "#7A5D24" },
+    paid: { bg: "#E4ECE4", fg: "#3B5C40" },
+  };
+  const t = tones[status] || tones.unpaid;
+  return (
+    <span
+      onClick={onClick}
+      title="Click to advance status"
+      style={{
+        background: t.bg,
+        color: t.fg,
+        fontFamily: "Inter, sans-serif",
+        fontSize: 11.5,
+        fontWeight: 500,
+        padding: "4px 10px",
+        borderRadius: 20,
+        whiteSpace: "nowrap",
+        cursor: "pointer",
+      }}
+    >
+      {labels[status] || labels.unpaid || "Unpaid"}
+    </span>
+  );
+};
+
 const Button = ({ children, onClick, variant = "default", style }) => {
   const base = {
     fontFamily: "Inter, sans-serif",
@@ -818,6 +941,14 @@ const ACCOUNT_DISPLAY_NAMES = {
   savings: "Savings",
   tax: "Taxes",
   bills: "Bills",
+};
+
+/* per-category accent colors used on budget cards and in the Reports breakdown */
+const CATEGORY_COLORS = {
+  groceries: { bg: "#E4ECE4", border: "#A9C7AE", text: "#3B5C40", bar: "#6B8F71" },
+  gas:       { bg: "#F8F0DC", border: "#E3D6A8", text: "#7A5D24", bar: "#C9A84C" },
+  eatingOut: { bg: "#F3E3DC", border: "#D9A98D", text: "#8A3C28", bar: "#C4714E" },
+  other:     { bg: "#EDE9DC", border: "#D8D2C2", text: "#5F5E5A", bar: "#8B96A3" },
 };
 
 /* A transfer row makes the amount and the from/to accounts equally prominent —
@@ -992,9 +1123,9 @@ function BudgetApp() {
     { id: "transfers", label: "To Do", icon: "ti-check" },
     { id: "shopping", label: "Shopping List", icon: "ti-folder" },
     { id: "income", label: "Income", icon: "ti-chart-bar" },
-    { id: "invoices", label: "Invoices", icon: "ti-file" },
     { id: "budgets", label: "Budgets", icon: "ti-calendar" },
     { id: "goals", label: "Goals", icon: "ti-star" },
+    { id: "reports", label: "Reports", icon: "ti-report" },
     { id: "alerts", label: "Alerts", icon: "ti-bell" },
     { id: "setup", label: "Setup", icon: "ti-settings" },
   ];
@@ -1184,12 +1315,12 @@ function BudgetApp() {
         )}
         {view === "dashboard" && <Dashboard state={state} update={update} setView={setView} isMobile={isMobile} />}
         {view === "income" && <IncomeView state={state} update={update} isMobile={isMobile} />}
-        {view === "invoices" && <InvoicesView state={state} update={update} isMobile={isMobile} />}
         {view === "budgets" && <BudgetsView state={state} update={update} isMobile={isMobile} />}
         {view === "goals" && <GoalsView state={state} update={update} isMobile={isMobile} />}
         {view === "transfers" && <TransfersView state={state} update={update} isMobile={isMobile} />}
         {view === "shopping" && <ShoppingListView state={state} update={update} isMobile={isMobile} />}
-        {view === "alerts" && <AlertsView state={state} update={update} isMobile={isMobile} />}
+        {view === "reports" && <ReportsView state={state} isMobile={isMobile} />}
+        {view === "alerts" && <AlertsView state={state} update={update} isMobile={isMobile} setView={setView} />}
         {view === "setup" && (
           <SetupWizard state={state} update={update} isMobile={isMobile} onFinish={() => setView("dashboard")} />
         )}
@@ -1206,13 +1337,15 @@ function Dashboard({ state, update, setView, isMobile }) {
   const moneyDateAlert = useMemo(() => checkMoneyDateAlert(state), [state]);
   const spendingPaceAlerts = useMemo(() => checkSpendingPaceAlerts(state), [state]);
   const weeklyProjection = useMemo(() => buildWeeklyProjection(state), [state]);
+  const bailoutStreak = useMemo(() => daysSinceLastBailout(state), [state]);
+  const monthlyRetro = useMemo(() => checkMonthlyRetro(state), [state]);
 
   const sortedBills = [...state.bills].sort((a, b) => a.day - b.day);
   const today = dayOfMonth();
   const upcoming = sortedBills.filter((b) => b.day >= today).slice(0, 4);
 
   const pendingTransfers = state.transfers.filter((t) => !t.done);
-  const unpaidInvoices = state.invoices.filter((i) => i.status === "unpaid");
+  const unpaidInvoices = state.invoices.filter((i) => i.status === "unpaid" || i.status === "pending");
   const outstandingTotal = unpaidInvoices.reduce((s, i) => s + i.amount, 0);
 
   return (
@@ -1221,6 +1354,57 @@ function Dashboard({ state, update, setView, isMobile }) {
         <SectionTitle eyebrow={new Date().toLocaleDateString(undefined, { month: "long", year: "numeric" })}>
           Dashboard
         </SectionTitle>
+      )}
+
+      <Card
+        style={{
+          marginBottom: 18,
+          background: bailoutStreak === null || bailoutStreak > 0 ? "#E4ECE4" : "#F8F0DC",
+          border: bailoutStreak === null || bailoutStreak > 0 ? "1px solid #A9C7AE" : "1px solid #E3D6A8",
+          cursor: "pointer",
+        }}
+        onClick={() => setView("transfers")}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <span style={{ fontWeight: 500, fontSize: 14, color: "#3B5C40" }}>
+            {bailoutStreak === null
+              ? "No bailout transfers yet"
+              : bailoutStreak === 0
+              ? "Bailout-free streak reset today"
+              : `${bailoutStreak} day${bailoutStreak === 1 ? "" : "s"} since your last bailout transfer`}
+          </span>
+          <span style={{ fontSize: 12, color: "#8B96A3" }}>Tap for To Do</span>
+        </div>
+      </Card>
+
+      {monthlyRetro.show && (
+        <Card style={{ background: "#F8F0DC", border: "1px solid #E3D6A8", marginBottom: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span style={{ fontWeight: 500, color: "#7A5D24", fontSize: 14 }}>
+              This month's bailout retro
+            </span>
+            <span
+              onClick={() => update((s) => ({ ...s, retroDismissedMonthKey: mKey }))}
+              style={{ fontSize: 12, color: "#7A5D24", cursor: "pointer" }}
+            >
+              Dismiss
+            </span>
+          </div>
+          <div style={{ fontSize: 13, color: "#7A5D24", marginTop: 6, lineHeight: 1.5 }}>
+            {monthlyRetro.count} bailout transfer{monthlyRetro.count === 1 ? "" : "s"} this month,
+            totaling {fmt(monthlyRetro.total)}. Worth a look at the To Do tab to see if there's a
+            pattern worth fixing for next month.
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <Button
+              variant="subtle"
+              style={{ padding: "6px 12px", fontSize: 12.5 }}
+              onClick={() => setView("transfers")}
+            >
+              Review bailout history
+            </Button>
+          </div>
+        </Card>
       )}
 
       {state.alerts.billWinAlertOn && state.lastWin && (
@@ -1265,38 +1449,6 @@ function Dashboard({ state, update, setView, isMobile }) {
         </Card>
       )}
 
-      {state.alerts.spendingPaceAlertOn && spendingPaceAlerts.length > 0 && (
-        <Card style={{ background: "#F3E3DC", border: "1px solid #D9A98D", marginBottom: 18 }}>
-          <span style={{ fontWeight: 500, color: "#8A3C28", fontSize: 14 }}>
-            Spending ahead of pace
-          </span>
-          <div style={{ marginTop: 6 }}>
-            {spendingPaceAlerts.map((c) => (
-              <div key={c.key} style={{ fontSize: 13, color: "#8A3C28", lineHeight: 1.6 }}>
-                {c.label}: {fmt(c.spent)} logged, {fmt(c.expectedByNow)} expected by today
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
-
-      {state.alerts.weeklyProjectionAlertOn && (
-        <Card style={{ marginBottom: 18, cursor: "pointer" }} onClick={() => setView("budgets")}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-            <span style={{ fontWeight: 500, fontSize: 14, color: "#1C2B3A" }}>This week</span>
-            <span style={{ fontSize: 12, color: "#8B96A3" }}>Tap for budgets</span>
-          </div>
-          <div style={{ fontSize: 13, color: "#5F5E5A", lineHeight: 1.6 }}>
-            {weeklyProjection.upcoming.length === 0
-              ? "No bills due in the next 7 days."
-              : `${weeklyProjection.upcoming.length} bill${weeklyProjection.upcoming.length === 1 ? "" : "s"} due this week, totaling ${fmt(weeklyProjection.upcomingTotal)}.`}
-          </div>
-          <div style={{ fontSize: 13, color: "#5F5E5A", marginTop: 2 }}>
-            Available funds after those: {fmt(weeklyProjection.availableFunds)}
-          </div>
-        </Card>
-      )}
-
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 24 }}>
         <MetricCard
           label="Checking"
@@ -1319,7 +1471,109 @@ function Dashboard({ state, update, setView, isMobile }) {
         />
         <MetricCard label="Slush fund" value={state.buckets.slush} tone="gold" />
         <MetricCard label="STSS (goals)" value={state.buckets.stss} tone="gold" />
+        {(state.leftoverSplit?.sinkingFund || 0) > 0 && (
+          <MetricCard label="Sinking fund" value={state.buckets.sinkingFund || 0} tone="gold" />
+        )}
       </div>
+
+      {state.alerts.spendingPaceAlertOn && spendingPaceAlerts.length > 0 && (
+        <Card style={{ background: "#F3E3DC", border: "1px solid #D9A98D", marginBottom: 18 }}>
+          <span style={{ fontWeight: 500, color: "#8A3C28", fontSize: 14 }}>
+            Spending ahead of pace
+          </span>
+          <div style={{ marginTop: 6 }}>
+            {spendingPaceAlerts.map((c) => {
+              const cc = CATEGORY_COLORS[c.key] || CATEGORY_COLORS.other;
+              return (
+                <div key={c.key} style={{ fontSize: 13, color: "#8A3C28", lineHeight: 1.6 }}>
+                  <span style={{ fontWeight: 500, color: cc.text }}>{c.label}</span>
+                  {": "}{fmt(c.spent)} logged, {fmt(c.expectedByNow)} expected by today
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {state.alerts.weeklyProjectionAlertOn && (
+        <Card style={{ marginBottom: 18, cursor: "pointer" }} onClick={() => setView("transfers")}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+            <span style={{ fontWeight: 500, fontSize: 14, color: "#1C2B3A" }}>This week</span>
+            <span style={{ fontSize: 12, color: "#8B96A3" }}>Tap for To Do</span>
+          </div>
+          <div style={{ fontSize: 13, color: "#5F5E5A", lineHeight: 1.6 }}>
+            {weeklyProjection.upcoming.length === 0
+              ? "No bills due in the next 7 days."
+              : `${weeklyProjection.upcoming.length} bill${weeklyProjection.upcoming.length === 1 ? "" : "s"} due this week, totaling ${fmt(weeklyProjection.upcomingTotal)}.`}
+          </div>
+          <div style={{ fontSize: 13, color: "#5F5E5A", marginTop: 2 }}>
+            Available funds after those: {fmt(weeklyProjection.availableFunds)}
+          </div>
+          {weeklyProjection.upcomingIrregular.length > 0 && (
+            <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #E3DDC9" }}>
+              <div style={{ fontSize: 12, color: "#7A5D24", fontWeight: 500, marginBottom: 4 }}>
+                Upcoming irregular expenses (next 30 days)
+              </div>
+              {weeklyProjection.upcomingIrregular.map((e) => (
+                <div key={e.id} style={{ fontSize: 12.5, color: "#7A5D24", lineHeight: 1.6 }}>
+                  {e.name} — {fmt(e.amount)} due {formatLocalDate(e.dueDate)}
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
+
+      {/* ── Eating out pace check ── always visible, glanceable before ordering */}
+      {(() => {
+        const mKey = monthKey();
+        const eatingOutBudget = state.budgets.eatingOut?.monthly || 0;
+        const eatingOutSpent = round2(
+          state.spending.filter((s) => s.category === "eatingOut" && s.monthKey === mKey).reduce((sum, s) => sum + s.amount, 0)
+        );
+        const remaining = round2(eatingOutBudget - eatingOutSpent);
+        const today2 = dayOfMonth();
+        const totalDays2 = daysInMonth();
+        const daysLeft = totalDays2 - today2 + 1;
+        const dailyAllowance = daysLeft > 0 ? round2(remaining / daysLeft) : 0;
+        const weekStart = today2 - ((new Date().getDay()));
+        const thisWeekSpent = round2(
+          state.spending.filter((s) => {
+            if (s.category !== "eatingOut" || s.monthKey !== mKey) return false;
+            const d = parseLocalDate(s.date).getDate();
+            return d >= Math.max(1, weekStart);
+          }).reduce((sum, s) => sum + s.amount, 0)
+        );
+        const pct = eatingOutBudget > 0 ? Math.min(100, Math.round((eatingOutSpent / eatingOutBudget) * 100)) : 0;
+        const toneColor = pct >= 90 ? "#8A3C28" : pct >= 70 ? "#7A5D24" : "#3B5C40";
+        const toneBg = pct >= 90 ? "#F3E3DC" : pct >= 70 ? "#F8F0DC" : "#E4ECE4";
+        return (
+          <Card style={{ marginBottom: 20, background: toneBg, border: `1px solid ${pct >= 90 ? "#D9A98D" : pct >= 70 ? "#E3D6A8" : "#A9C7AE"}` }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+              <span style={{ fontWeight: 500, fontSize: 14, color: toneColor }}>Before you order out</span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, color: toneColor }}>{pct}% used</span>
+            </div>
+            <div style={{ height: 5, borderRadius: 3, background: "rgba(0,0,0,0.08)", marginBottom: 10 }}>
+              <div style={{ height: "100%", borderRadius: 3, width: `${pct}%`, background: toneColor }} />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+              {[
+                { label: "Remaining", value: fmt(Math.max(0, remaining)) },
+                { label: "Days left", value: `${daysLeft}d` },
+                { label: "Daily left", value: dailyAllowance > 0 ? fmt(dailyAllowance) : "—" },
+              ].map(({ label, value }) => (
+                <div key={label}>
+                  <div style={{ fontSize: 11.5, color: toneColor, opacity: 0.8, marginBottom: 2 }}>{label}</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 15, fontWeight: 500, color: toneColor }}>{value}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: 12, color: toneColor, opacity: 0.8, marginTop: 8 }}>
+              This week: {fmt(thisWeekSpent)} spent on eating out
+            </div>
+          </Card>
+        );
+      })()}
 
       {unpaidInvoices.length > 0 && (
         <Card style={{ marginBottom: 24, background: "#F8F0DC", border: "1px solid #E3D6A8" }}>
@@ -1378,7 +1632,7 @@ function Dashboard({ state, update, setView, isMobile }) {
               <LedgerRow
                 key={b.id}
                 label={b.name}
-                sub={`Due on the ${ordinal(b.day)}`}
+                sub={billDueSub(b)}
                 amount={b.amount}
                 right={
                   <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -1389,7 +1643,7 @@ function Dashboard({ state, update, setView, isMobile }) {
                       onChange={(v) =>
                         update((s) => ({
                           ...s,
-                          bills: s.bills.map((x) => (x.id === b.id ? { ...x, amount: v } : x)),
+                          bills: s.bills.map((x) => (x.id === b.id ? { ...x, amount: v, realAmount: null } : x)),
                         }))
                       }
                     />
@@ -1403,12 +1657,10 @@ function Dashboard({ state, update, setView, isMobile }) {
                         cursor: "pointer",
                       }}
                     >
-                      <input
-                        type="checkbox"
-                        checked={!!b.paid}
-                        onChange={() => update((s) => markBillPaid(s, b.id))}
+                      <StatusBadge
+                        status={b.status || (b.paid ? "paid" : "unpaid")}
+                        onClick={() => update((s) => advanceBillStatus(s, b.id))}
                       />
-                      Paid
                     </label>
                   </div>
                 }
@@ -1556,6 +1808,16 @@ function ordinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
+/* sub-line text for a bill row: due date, plus a note about any rounding
+   cushion built into the amount, if the bill was padded when created. */
+function billDueSub(b) {
+  const base = `Due on the ${ordinal(b.day)}`;
+  if (b.realAmount != null && b.realAmount < b.amount) {
+    return `${base} · actual ${fmt(b.realAmount)}, padded for ${fmt(round2(b.amount - b.realAmount))} cushion`;
+  }
+  return base;
+}
+
 /* ---------- Income View ---------- */
 function IncomeView({ state, update, isMobile }) {
   const [amount, setAmount] = useState("");
@@ -1567,6 +1829,15 @@ function IncomeView({ state, update, isMobile }) {
   const totalThisMonth = monthIncome.reduce((s, i) => s + i.amount, 0);
   const projection = state.monthlyIncomeProjection;
 
+  const [description, setDescription] = useState("");
+  const [invAmount, setInvAmount] = useState("");
+  const [issueDate, setIssueDate] = useState(todayISO());
+
+  const unpaid = state.invoices.filter((i) => i.status === "unpaid");
+  const pending = state.invoices.filter((i) => i.status === "pending");
+  const paid = state.invoices.filter((i) => i.status === "paid");
+  const totalOutstanding = [...unpaid, ...pending].reduce((s, i) => s + i.amount, 0);
+
   function addIncome() {
     const amt = parseFloat(amount);
     if (!amt || amt <= 0) return;
@@ -1576,6 +1847,7 @@ function IncomeView({ state, update, isMobile }) {
       amount: round2(amt),
       type,
       monthKey: monthKey(parseLocalDate(date)),
+      status: STATUS.PENDING,
     };
 
     update((s) => {
@@ -1608,6 +1880,7 @@ function IncomeView({ state, update, isMobile }) {
       // by resetting to the freshly computed split (idempotent w.r.t. all income logged).
       newBuckets.slush = split.slushAdd;
       newBuckets.stss = split.stssAdd;
+      newBuckets.sinkingFund = split.sinkingFundAdd;
 
       return {
         ...s,
@@ -1620,11 +1893,61 @@ function IncomeView({ state, update, isMobile }) {
     setAmount("");
   }
 
+  function toggleIncomePosted(id) {
+    update((s) => ({
+      ...s,
+      income: s.income.map((i) =>
+        i.id === id ? { ...i, status: i.status === STATUS.PAID ? STATUS.PENDING : STATUS.PAID } : i
+      ),
+    }));
+  }
+
+  function addInvoice() {
+    const amt = parseFloat(invAmount);
+    if (!description || !amt || amt <= 0) return;
+    update((s) => ({
+      ...s,
+      invoices: [
+        ...s.invoices,
+        {
+          id: uid("inv"),
+          description,
+          amount: round2(amt),
+          issueDate,
+          status: "unpaid",
+          paidDate: null,
+          incomeId: null,
+        },
+      ],
+    }));
+    setDescription("");
+    setInvAmount("");
+    setIssueDate(todayISO());
+  }
+
+  // moves an invoice between Unpaid and Pending — no money moves yet, just tracking
+  // that payment is in motion but hasn't cleared into the account
+  function toggleInvoicePending(invoiceId) {
+    update((s) => ({
+      ...s,
+      invoices: s.invoices.map((i) =>
+        i.id === invoiceId
+          ? { ...i, status: i.status === "pending" ? "unpaid" : "pending" }
+          : i
+      ),
+    }));
+  }
+
+  // the real conversion to income — only happens on the actual Paid transition
+  function markInvoicePaid(invoiceId) {
+    update((s) => convertInvoiceToIncome(s, invoiceId));
+  }
+
   return (
     <div>
-      <SectionTitle eyebrow="Variable income">Income</SectionTitle>
+      <SectionTitle eyebrow="Income & invoices">Income</SectionTitle>
 
-      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 20, marginBottom: 24 }}>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 1fr", gap: 20, marginBottom: 24 }}>
         <Card>
           <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>
             Logged this month
@@ -1667,9 +1990,20 @@ function IncomeView({ state, update, isMobile }) {
               }
               style={{ width: 120 }}
             />
-            <span style={{ fontSize: 12.5, color: "#8B96A3" }}>
-              Adjust as your estimate for the month changes
-            </span>
+          </div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginTop: 8 }}>
+            Adjust as your estimate for the month changes
+          </div>
+        </Card>
+
+        <Card>
+          <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>Invoices outstanding</div>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 26, color: "#1C2B3A" }}>
+            {fmt(totalOutstanding)}
+          </div>
+          <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 4 }}>
+            across {unpaid.length + pending.length} invoice{unpaid.length + pending.length === 1 ? "" : "s"}
+            {pending.length > 0 ? ` (${pending.length} pending)` : ""}
           </div>
         </Card>
       </div>
@@ -1706,7 +2040,7 @@ function IncomeView({ state, update, isMobile }) {
                 color: "#1C2B3A",
               }}
             >
-              <option value="regular">Regular</option>
+              <option value="regular">W-2</option>
               <option value="freelance">Freelance</option>
             </select>
           </div>
@@ -1725,8 +2059,8 @@ function IncomeView({ state, update, isMobile }) {
         )}
       </Card>
 
-      <Card>
-        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 8 }}>This month's entries</div>
+      <Card style={{ marginBottom: 24 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 8 }}>This month's income entries</div>
         {monthIncome.length === 0 ? (
           <div style={{ fontSize: 13, color: "#8B96A3" }}>No income logged yet this month.</div>
         ) : (
@@ -1737,68 +2071,30 @@ function IncomeView({ state, update, isMobile }) {
               .map((i) => (
                 <LedgerRow
                   key={i.id}
-                  label={i.type === "freelance" ? "Freelance income" : "Regular income"}
+                  label={i.type === "freelance" ? "Freelance income" : "W-2 income"}
                   sub={formatLocalDate(i.date)}
                   amount={i.amount}
+                  right={
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14 }}>
+                        {fmt(i.amount)}
+                      </span>
+                      <StatusBadge
+                        status={i.status || "pending"}
+                        postedLabel
+                        onClick={() => toggleIncomePosted(i.id)}
+                      />
+                    </div>
+                  }
                 />
               ))}
           </Ledger>
         )}
       </Card>
-    </div>
-  );
-}
 
-/* ---------- Invoices View ---------- */
-function InvoicesView({ state, update, isMobile }) {
-  const [description, setDescription] = useState("");
-  const [amount, setAmount] = useState("");
-  const [issueDate, setIssueDate] = useState(todayISO());
-
-  const unpaid = state.invoices.filter((i) => i.status === "unpaid");
-  const paid = state.invoices.filter((i) => i.status === "paid");
-  const totalUnpaid = unpaid.reduce((s, i) => s + i.amount, 0);
-
-  function addInvoice() {
-    const amt = parseFloat(amount);
-    if (!description || !amt || amt <= 0) return;
-    update((s) => ({
-      ...s,
-      invoices: [
-        ...s.invoices,
-        {
-          id: uid("inv"),
-          description,
-          amount: round2(amt),
-          issueDate,
-          status: "unpaid",
-          paidDate: null,
-          incomeId: null,
-        },
-      ],
-    }));
-    setDescription("");
-    setAmount("");
-    setIssueDate(todayISO());
-  }
-
-  function markPaid(invoiceId) {
-    update((s) => convertInvoiceToIncome(s, invoiceId));
-  }
-
-  return (
-    <div>
-      <SectionTitle eyebrow="What you're still waiting on">Invoices</SectionTitle>
-
-      <Card style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 4 }}>Outstanding</div>
-        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 26, color: "#1C2B3A" }}>
-          {fmt(totalUnpaid)}
-        </div>
-        <div style={{ fontSize: 12.5, color: "#8B96A3", marginTop: 4 }}>
-          across {unpaid.length} unpaid invoice{unpaid.length === 1 ? "" : "s"}
-        </div>
-      </Card>
+      <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12, marginTop: 8 }}>
+        Invoices
+      </div>
 
       <Card style={{ marginBottom: 24 }}>
         <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Add an invoice</div>
@@ -1817,8 +2113,8 @@ function InvoicesView({ state, update, isMobile }) {
             <Input
               type="number"
               placeholder="0.00"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
+              value={invAmount}
+              onChange={(e) => setInvAmount(e.target.value)}
               style={{ width: 110 }}
             />
           </div>
@@ -1829,20 +2125,20 @@ function InvoicesView({ state, update, isMobile }) {
           <Button onClick={addInvoice}>Add invoice</Button>
         </div>
         <div style={{ fontSize: 12, color: "#8B96A3", marginTop: 10 }}>
-          When marked paid, this becomes freelance income dated today — 15% set aside for taxes,
-          10% to savings — while the issue date stays on record here.
+          Click the status badge to mark a payment as in motion (Pending), then use "Mark paid"
+          once it's actually cleared into your account — that's when it becomes freelance income,
+          with 15% set aside for taxes and 10% to savings.
         </div>
       </Card>
 
       <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 20 }}>
         <Card>
-          <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Unpaid</div>
-          {unpaid.length === 0 ? (
+          <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 10 }}>Unpaid & pending</div>
+          {unpaid.length === 0 && pending.length === 0 ? (
             <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing outstanding right now.</div>
           ) : (
             <Ledger>
-              {unpaid
-                .slice()
+              {[...unpaid, ...pending]
                 .sort((a, b) => parseLocalDate(a.issueDate) - parseLocalDate(b.issueDate))
                 .map((i) => (
                   <LedgerRow
@@ -1855,13 +2151,16 @@ function InvoicesView({ state, update, isMobile }) {
                         <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14 }}>
                           {fmt(i.amount)}
                         </span>
-                        <Button
-                          variant="subtle"
-                          style={{ padding: "5px 10px", fontSize: 12 }}
-                          onClick={() => markPaid(i.id)}
-                        >
-                          Mark paid
-                        </Button>
+                        <StatusBadge status={i.status} onClick={() => toggleInvoicePending(i.id)} />
+                        {i.status === "pending" && (
+                          <Button
+                            variant="subtle"
+                            style={{ padding: "5px 10px", fontSize: 12 }}
+                            onClick={() => markInvoicePaid(i.id)}
+                          >
+                            Mark paid
+                          </Button>
+                        )}
                       </div>
                     }
                   />
@@ -1903,6 +2202,8 @@ function BudgetsView({ state, update, isMobile }) {
   const [newBillName, setNewBillName] = useState("");
   const [newBillAmount, setNewBillAmount] = useState("");
   const [newBillDay, setNewBillDay] = useState("");
+  const [roundUp, setRoundUp] = useState(false);
+  const [roundIncrement, setRoundIncrement] = useState(5);
   const [tagDrafts, setTagDrafts] = useState({}); // { [categoryKey]: rawCommaSeparatedString }
   const [expandedTags, setExpandedTags] = useState({}); // { [categoryKey]: boolean }
   const [otherExpanded, setOtherExpanded] = useState(true);
@@ -1913,16 +2214,28 @@ function BudgetsView({ state, update, isMobile }) {
 
   function addBill() {
     if (!newBillName || !newBillAmount || !newBillDay) return;
+    const realAmount = parseFloat(newBillAmount);
+    const paddedAmount = roundUp ? roundUpTo(realAmount, roundIncrement) : realAmount;
     update((s) => ({
       ...s,
       bills: [
         ...s.bills,
-        { id: uid("bill"), name: newBillName, amount: parseFloat(newBillAmount), day: parseInt(newBillDay) },
+        {
+          id: uid("bill"),
+          name: newBillName,
+          amount: round2(paddedAmount),
+          realAmount: round2(realAmount),
+          day: parseInt(newBillDay),
+          status: STATUS.UNPAID,
+          paid: false,
+          paidMonthKey: null,
+        },
       ],
     }));
     setNewBillName("");
     setNewBillAmount("");
     setNewBillDay("");
+    setRoundUp(false);
   }
 
   function removeBill(id) {
@@ -1933,6 +2246,15 @@ function BudgetsView({ state, update, isMobile }) {
     return state.spending
       .filter((sp) => sp.category === cat && sp.monthKey === mKey)
       .reduce((sum, sp) => sum + sp.amount, 0);
+  }
+
+  function toggleSpendingPosted(id) {
+    update((s) => ({
+      ...s,
+      spending: s.spending.map((sp) =>
+        sp.id === id ? { ...sp, status: sp.status === STATUS.PAID ? STATUS.PENDING : STATUS.PAID } : sp
+      ),
+    }));
   }
 
   // all tags ever used, for auto-suggest across every category.
@@ -1983,7 +2305,7 @@ function BudgetsView({ state, update, isMobile }) {
               <LedgerRow
                 key={b.id}
                 label={b.name}
-                sub={`Due on the ${ordinal(b.day)}`}
+                sub={billDueSub(b)}
                 amount={b.amount}
                 right={
                   <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
@@ -1994,27 +2316,14 @@ function BudgetsView({ state, update, isMobile }) {
                       onChange={(v) =>
                         update((s) => ({
                           ...s,
-                          bills: s.bills.map((x) => (x.id === b.id ? { ...x, amount: v } : x)),
+                          bills: s.bills.map((x) => (x.id === b.id ? { ...x, amount: v, realAmount: null } : x)),
                         }))
                       }
                     />
-                    <label
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 4,
-                        fontSize: 11.5,
-                        color: "#8B96A3",
-                        cursor: "pointer",
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={!!b.paid}
-                        onChange={() => update((s) => markBillPaid(s, b.id))}
-                      />
-                      Paid
-                    </label>
+                    <StatusBadge
+                      status={b.status || (b.paid ? "paid" : "unpaid")}
+                      onClick={() => update((s) => advanceBillStatus(s, b.id))}
+                    />
                     <span
                       onClick={() => removeBill(b.id)}
                       style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}
@@ -2053,6 +2362,37 @@ function BudgetsView({ state, update, isMobile }) {
             Add bill
           </Button>
         </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#1C2B3A", cursor: "pointer" }}>
+            <input type="checkbox" checked={roundUp} onChange={(e) => setRoundUp(e.target.checked)} />
+            Round up for a little cushion
+          </label>
+          {roundUp && (
+            <select
+              value={roundIncrement}
+              onChange={(e) => setRoundIncrement(parseInt(e.target.value))}
+              style={{
+                fontFamily: "Inter, sans-serif",
+                fontSize: 12.5,
+                padding: "5px 8px",
+                borderRadius: 6,
+                border: "1px solid #D8D2C2",
+                background: "#FFFEFB",
+                color: "#1C2B3A",
+              }}
+            >
+              <option value={5}>Nearest $5</option>
+              <option value={10}>Nearest $10</option>
+            </select>
+          )}
+          {roundUp && newBillAmount && (
+            <span style={{ fontSize: 12, color: "#3B5C40" }}>
+              Will set aside {fmt(roundUpTo(parseFloat(newBillAmount) || 0, roundIncrement))} — a buffer of{" "}
+              {fmt(round2(roundUpTo(parseFloat(newBillAmount) || 0, roundIncrement) - (parseFloat(newBillAmount) || 0)))}{" "}
+              stays in the Bills bucket each month.
+            </span>
+          )}
+        </div>
       </Card>
 
       <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>
@@ -2066,11 +2406,12 @@ function BudgetsView({ state, update, isMobile }) {
           const weeklyBudgetSoFar = weeklyTarget * weekNum;
           const pct = Math.min(100, (spent / b.monthly) * 100);
           const over = spent > b.monthly * pace + 0.01;
+          const cc = CATEGORY_COLORS[key] || CATEGORY_COLORS.other;
 
           return (
-            <Card key={key}>
+            <Card key={key} style={{ borderTop: `3px solid ${cc.border}` }}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                <span style={{ fontWeight: 500, fontSize: 14 }}>{b.label}</span>
+                <span style={{ fontWeight: 500, fontSize: 14, color: cc.text }}>{b.label}</span>
                 {over && <Pill tone="warn">Ahead of pace</Pill>}
               </div>
               <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 20, color: "#1C2B3A" }}>
@@ -2092,7 +2433,7 @@ function BudgetsView({ state, update, isMobile }) {
                   style={{
                     height: "100%",
                     width: `${pct}%`,
-                    background: over ? "#C1684F" : "#6B8F71",
+                    background: over ? "#C1684F" : cc.bar,
                   }}
                 />
               </div>
@@ -2126,6 +2467,7 @@ function BudgetsView({ state, update, isMobile }) {
                           date: todayISO(),
                           monthKey: mKey,
                           tags,
+                          status: STATUS.PENDING,
                         },
                       ],
                     }));
@@ -2271,6 +2613,7 @@ function BudgetsView({ state, update, isMobile }) {
                       date: todayISO(),
                       monthKey: mKey,
                       tags,
+                      status: STATUS.PENDING,
                     },
                   ],
                 }));
@@ -2317,6 +2660,18 @@ function BudgetsView({ state, update, isMobile }) {
                         label={sp.description ? sp.description : (sp.tags && sp.tags.length ? sp.tags.join(", ") : "Untagged")}
                         sub={`${formatLocalDate(sp.date)}${sp.description && sp.tags && sp.tags.length ? " · " + sp.tags.join(", ") : ""}`}
                         amount={sp.amount}
+                        right={
+                          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14 }}>
+                              {fmt(sp.amount)}
+                            </span>
+                            <StatusBadge
+                              status={sp.status || "pending"}
+                              postedLabel
+                              onClick={() => toggleSpendingPosted(sp.id)}
+                            />
+                          </div>
+                        }
                       />
                     ))}
                   </Ledger>
@@ -2684,12 +3039,27 @@ function TransfersView({ state, update, isMobile }) {
             reason: reason.trim(),
             date: todayISO(),
             monthKey: mKey,
+            status: STATUS.PENDING,
+            postedDate: null,
           },
         ],
       };
     });
     setAmount("");
     setReason("");
+  }
+
+  function toggleBailoutPosted(id) {
+    update((s) => ({
+      ...s,
+      bailouts: s.bailouts.map((b) =>
+        b.id === id
+          ? b.status === STATUS.PAID
+            ? { ...b, status: STATUS.PENDING, postedDate: null }
+            : { ...b, status: STATUS.PAID, postedDate: todayISO() }
+          : b
+      ),
+    }));
   }
 
   return (
@@ -2748,7 +3118,8 @@ function TransfersView({ state, update, isMobile }) {
       </div>
       <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14 }}>
         For moving money between buckets to cover a surprise shortfall — tracked separately so
-        you can see the pattern and work toward needing fewer of these.
+        you can see the pattern and work toward needing fewer of these. Your bailout-free streak
+        is shown on the Dashboard.
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 16, marginBottom: 20 }}>
@@ -2867,22 +3238,526 @@ function TransfersView({ state, update, isMobile }) {
                   sub={`${formatLocalDate(b.date)}${b.reason ? " · " + b.reason : ""}`}
                   amount={b.amount}
                   accent="#8A3C28"
+                  right={
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, color: "#8A3C28" }}>
+                        {fmt(b.amount)}
+                      </span>
+                      <StatusBadge
+                        status={b.status || "pending"}
+                        postedLabel
+                        onClick={() => toggleBailoutPosted(b.id)}
+                      />
+                    </div>
+                  }
                 />
               ))}
           </Ledger>
         )}
+      </Card>
+
+      <IrregularExpensesSection state={state} update={update} isMobile={isMobile} />
+    </div>
+  );
+}
+
+/* Irregular / upcoming one-time expenses — shown in the To Do tab alongside transfers.
+   Upcoming ones (due within 30 days) also appear in the Dashboard weekly projection. */
+function IrregularExpensesSection({ state, update, isMobile }) {
+  const [name, setName] = useState("");
+  const [amount, setAmount] = useState("");
+  const [dueDate, setDueDate] = useState("");
+  const [notes, setNotes] = useState("");
+
+  const expenses = state.irregularExpenses || [];
+  const upcoming = expenses.filter((e) => !e.paid).sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+  const past = expenses.filter((e) => e.paid).slice(-5).reverse();
+
+  function addExpense() {
+    if (!name || !amount || !dueDate) return;
+    update((s) => ({
+      ...s,
+      irregularExpenses: [
+        ...(s.irregularExpenses || []),
+        { id: uid("irr"), name, amount: parseFloat(amount), dueDate, notes: notes.trim(), paid: false, paidDate: null },
+      ],
+    }));
+    setName(""); setAmount(""); setDueDate(""); setNotes("");
+  }
+
+  function markPaid(id) {
+    update((s) => ({
+      ...s,
+      irregularExpenses: (s.irregularExpenses || []).map((e) =>
+        e.id === id ? { ...e, paid: true, paidDate: todayISO() } : e
+      ),
+    }));
+  }
+
+  function removeExpense(id) {
+    update((s) => ({ ...s, irregularExpenses: (s.irregularExpenses || []).filter((e) => e.id !== id) }));
+  }
+
+  const today = new Date(); today.setHours(0,0,0,0);
+
+  return (
+    <Card style={{ marginTop: 20 }}>
+      <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Upcoming irregular expenses</div>
+      <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14 }}>
+        One-time or annual costs coming up — car registration, medical bills, subscriptions, etc.
+        Upcoming ones show in the Dashboard projection. Pay them from your sinking fund.
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+        <div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Name</div>
+          <Input placeholder="e.g. Car registration" value={name} onChange={(e) => setName(e.target.value)} style={{ width: 180 }} />
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Amount</div>
+          <Input type="number" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} style={{ width: 90 }} />
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Due date</div>
+          <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>Notes (optional)</div>
+          <Input placeholder="e.g. from sinking fund" value={notes} onChange={(e) => setNotes(e.target.value)} style={{ width: 160 }} />
+        </div>
+        <Button variant="subtle" onClick={addExpense}>Add</Button>
+      </div>
+
+      {upcoming.length === 0 ? (
+        <div style={{ fontSize: 13, color: "#8B96A3" }}>Nothing upcoming — add one above.</div>
+      ) : (
+        <Ledger>
+          {upcoming.map((e) => {
+            const due = new Date(e.dueDate + "T00:00:00");
+            const daysAway = Math.round((due - today) / (1000 * 60 * 60 * 24));
+            const urgent = daysAway <= 14;
+            const overdue = daysAway < 0;
+            return (
+              <LedgerRow
+                key={e.id}
+                label={e.name}
+                sub={
+                  overdue ? `Overdue by ${Math.abs(daysAway)}d` :
+                  daysAway === 0 ? "Due today" :
+                  `Due in ${daysAway}d · ${formatLocalDate(e.dueDate)}${e.notes ? " · " + e.notes : ""}`
+                }
+                amount={e.amount}
+                accent={overdue ? "#8A3C28" : urgent ? "#7A5D24" : undefined}
+                right={
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <Button variant="subtle" style={{ fontSize: 12, padding: "4px 10px" }} onClick={() => markPaid(e.id)}>
+                      Mark paid
+                    </Button>
+                    <span onClick={() => removeExpense(e.id)} style={{ fontSize: 12, color: "#8B96A3", cursor: "pointer" }}>Remove</span>
+                  </div>
+                }
+              />
+            );
+          })}
+        </Ledger>
+      )}
+
+      {past.length > 0 && (
+        <div style={{ marginTop: 14, borderTop: "1px solid #E3DDC9", paddingTop: 12 }}>
+          <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 8 }}>Recently paid</div>
+          <Ledger>
+            {past.map((e) => (
+              <LedgerRow key={e.id} label={e.name} sub={e.paidDate ? `Paid ${formatLocalDate(e.paidDate)}` : "Paid"} amount={e.amount} />
+            ))}
+          </Ledger>
+        </div>
+      )}
+    </Card>
+  );
+}
+/* ---------- Reports View ----------
+   Full monthly spending breakdown with category totals, tag breakdowns, income
+   summary, bills, bailouts, and month-over-month comparison. Defaults to the
+   current calendar month; a dropdown lets you switch to any month present in the
+   data. A CSV download captures everything currently visible for that month. */
+function ReportsView({ state, isMobile }) {
+  const currentMKey = monthKey();
+
+  /* build sorted list of all month keys that appear anywhere in the data */
+  const allMonthKeys = useMemo(() => {
+    const keys = new Set([currentMKey]);
+    state.income.forEach((i) => keys.add(i.monthKey));
+    state.spending.forEach((s) => keys.add(s.monthKey));
+    state.bailouts.forEach((b) => keys.add(b.monthKey));
+    state.billPaidHistory.forEach((h) => keys.add(h.monthKey));
+    return [...keys].sort().reverse(); // newest first
+  }, [state, currentMKey]);
+
+  const [selectedMKey, setSelectedMKey] = useState(currentMKey);
+
+  /* previous month key for comparison */
+  function prevMKey(mk) {
+    const [y, m] = mk.split("-").map(Number);
+    const prev = new Date(y, m - 2, 1);
+    return monthKey(prev);
+  }
+  const prevKey = prevMKey(selectedMKey);
+
+  function monthLabel(mk) {
+    const [y, m] = mk.split("-").map(Number);
+    return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  }
+
+  /* ── data selectors ── */
+  function incomeForMonth(mk) {
+    return state.income.filter((i) => i.monthKey === mk);
+  }
+  function spendingForMonth(mk) {
+    return state.spending.filter((s) => s.monthKey === mk);
+  }
+  function bailoutsForMonth(mk) {
+    return state.bailouts.filter((b) => b.monthKey === mk);
+  }
+  function billHistoryForMonth(mk) {
+    return state.billPaidHistory.filter((h) => h.monthKey === mk);
+  }
+
+  const income = incomeForMonth(selectedMKey);
+  const prevIncome = incomeForMonth(prevKey);
+  const spending = spendingForMonth(selectedMKey);
+  const prevSpending = spendingForMonth(prevKey);
+  const bailouts = bailoutsForMonth(selectedMKey);
+  const prevBailouts = bailoutsForMonth(prevKey);
+  const billHistory = billHistoryForMonth(selectedMKey);
+
+  /* ── computed totals ── */
+  const totalIncome = round2(income.reduce((s, i) => s + i.amount, 0));
+  const prevTotalIncome = round2(prevIncome.reduce((s, i) => s + i.amount, 0));
+  const regularIncome = round2(income.filter((i) => i.type === "regular").reduce((s, i) => s + i.amount, 0));
+  const freelanceIncome = round2(income.filter((i) => i.type === "freelance").reduce((s, i) => s + i.amount, 0));
+
+  const budgetCategories = Object.entries(state.budgets).map(([key, b]) => ({ key, label: b.label, monthly: b.monthly }));
+
+  function catSpend(key, sp) {
+    return round2(sp.filter((s) => s.category === key).reduce((sum, s) => sum + s.amount, 0));
+  }
+  function catTags(key, sp) {
+    const entries = sp.filter((s) => s.category === key);
+    const tagMap = {};
+    entries.forEach((s) => {
+      const tags = s.tags && s.tags.length ? s.tags : ["untagged"];
+      tags.forEach((t) => { tagMap[t] = round2((tagMap[t] || 0) + s.amount); });
+    });
+    return Object.entries(tagMap).sort((a, b) => b[1] - a[1]);
+  }
+
+  const otherSpend = round2(spending.filter((s) => s.category === "other").reduce((sum, s) => sum + s.amount, 0));
+  const prevOtherSpend = round2(prevSpending.filter((s) => s.category === "other").reduce((sum, s) => sum + s.amount, 0));
+  const totalSpend = round2(spending.reduce((s, x) => s + x.amount, 0));
+  const prevTotalSpend = round2(prevSpending.reduce((s, x) => s + x.amount, 0));
+
+  const totalBailouts = round2(bailouts.reduce((s, b) => s + b.amount, 0));
+  const prevTotalBailouts = round2(prevBailouts.reduce((s, b) => s + b.amount, 0));
+
+  /* bills info pulled from the bill paid history for the selected month */
+  const billsPaidCount = billHistory.length;
+  const billsPaidTotal = round2(billHistory.reduce((s, h) => s + h.amount, 0));
+
+  /* ── delta helper ── */
+  function delta(current, previous) {
+    if (previous === 0) return null;
+    return round2(current - previous);
+  }
+  function DeltaPill({ curr, prev, lowerIsBetter = false }) {
+    const d = delta(curr, prev);
+    if (d === null || prev === 0) return null;
+    const up = d > 0;
+    const good = lowerIsBetter ? !up : up;
+    const color = good ? "#3B5C40" : "#8A3C28";
+    const bg = good ? "#E4ECE4" : "#F3E3DC";
+    return (
+      <span style={{ fontSize: 11.5, fontWeight: 500, padding: "2px 8px", borderRadius: 20, background: bg, color, marginLeft: 8 }}>
+        {up ? "+" : ""}{fmt(d)}
+      </span>
+    );
+  }
+
+  /* ── CSV download ── */
+  function downloadCSV() {
+    const rows = [["Month", monthLabel(selectedMKey)], [""]];
+
+    rows.push(["INCOME"]);
+    rows.push(["Type", "Amount"]);
+    rows.push(["Regular", regularIncome]);
+    rows.push(["Freelance", freelanceIncome]);
+    rows.push(["Total income", totalIncome]);
+    rows.push([""]);
+
+    rows.push(["SPENDING BY CATEGORY"]);
+    rows.push(["Category", "Amount", "Budget", "vs Budget"]);
+    budgetCategories.forEach(({ key, label, monthly }) => {
+      const spent = catSpend(key, spending);
+      rows.push([label, spent, monthly, round2(spent - monthly)]);
+    });
+    rows.push(["Other", otherSpend, "", ""]);
+    rows.push(["Total spending", totalSpend, "", ""]);
+    rows.push([""]);
+
+    rows.push(["TAG BREAKDOWN"]);
+    budgetCategories.forEach(({ key, label }) => {
+      const tags = catTags(key, spending);
+      if (tags.length) {
+        rows.push([label + " tags"]);
+        tags.forEach(([tag, amt]) => rows.push(["", tag, amt]));
+      }
+    });
+    rows.push([""]);
+
+    rows.push(["BILLS PAID THIS MONTH"]);
+    rows.push(["Bill", "Amount", "Date paid"]);
+    billHistory.forEach((h) => rows.push([h.billName, h.amount, h.paidDate || ""]));
+    rows.push(["Total bills paid", billsPaidTotal, ""]);
+    rows.push([""]);
+
+    rows.push(["BAILOUT TRANSFERS"]);
+    rows.push(["From", "To", "Amount", "Reason", "Date"]);
+    bailouts.forEach((b) => rows.push([
+      b.fromBucket, b.toBucket, b.amount, b.reason || "", b.date || ""
+    ]));
+    rows.push(["Total bailouts", totalBailouts, "", "", ""]);
+
+    const csv = rows.map((r) => r.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ledger-report-${selectedMKey}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  const hasPrev = allMonthKeys.includes(prevKey);
+
+  return (
+    <div>
+      {/* header + month picker */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, marginBottom: 20 }}>
+        <SectionTitle eyebrow="Monthly breakdown">{monthLabel(selectedMKey)}</SectionTitle>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <select
+            value={selectedMKey}
+            onChange={(e) => setSelectedMKey(e.target.value)}
+            style={{
+              fontFamily: "Inter, sans-serif", fontSize: 13.5, padding: "7px 10px",
+              borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A",
+            }}
+          >
+            {allMonthKeys.map((mk) => (
+              <option key={mk} value={mk}>{monthLabel(mk)}</option>
+            ))}
+          </select>
+          <Button variant="subtle" onClick={downloadCSV}>
+            Export CSV
+          </Button>
+        </div>
+      </div>
+
+      {/* ── Income ── */}
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Income</div>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(4, 1fr)", gap: 12, marginBottom: hasPrev ? 12 : 0 }}>
+          {[
+            { label: "Total", value: totalIncome, prev: prevTotalIncome, lowerIsBetter: false },
+            { label: "W-2", value: regularIncome, prev: round2(prevIncome.filter((i) => i.type === "regular").reduce((s, i) => s + i.amount, 0)) },
+            { label: "Freelance", value: freelanceIncome, prev: round2(prevIncome.filter((i) => i.type === "freelance").reduce((s, i) => s + i.amount, 0)) },
+            { label: "Projection", value: state.monthlyIncomeProjection, prev: null },
+          ].map(({ label, value, prev, lowerIsBetter }) => (
+            <div key={label} style={{ background: "#F7F4EC", borderRadius: 6, padding: "10px 12px" }}>
+              <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>{label}</div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 17, fontWeight: 500, color: "#1C2B3A" }}>
+                {fmt(value)}
+              </div>
+              {hasPrev && prev !== null && (
+                <div style={{ fontSize: 11.5, color: "#8B96A3", marginTop: 2 }}>
+                  prev {fmt(prev)}
+                  <DeltaPill curr={value} prev={prev} lowerIsBetter={lowerIsBetter} />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+        {income.length === 0 && (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>No income logged for this month.</div>
+        )}
+      </Card>
+
+      {/* ── Spending by category ── */}
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Spending by category</div>
+        <Ledger>
+          {budgetCategories.map(({ key, label, monthly }) => {
+            const spent = catSpend(key, spending);
+            const prev = catSpend(key, prevSpending);
+            const pct = monthly > 0 ? Math.min(100, Math.round((spent / monthly) * 100)) : null;
+            const over = monthly > 0 && spent > monthly;
+            const tags = catTags(key, spending);
+            const cc = CATEGORY_COLORS[key] || CATEGORY_COLORS.other;
+            return (
+              <div key={key} style={{ padding: "10px 0", borderBottom: "1px solid #E3DDC9" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+                  <span style={{ fontSize: 13.5, fontWeight: 500, color: cc.text }}>{label}</span>
+                  <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, color: over ? "#8A3C28" : "#1C2B3A" }}>
+                    {fmt(spent)}
+                    {monthly > 0 && (
+                      <span style={{ fontSize: 12, color: "#8B96A3", marginLeft: 4 }}>/ {fmt(monthly)}</span>
+                    )}
+                    {hasPrev && <DeltaPill curr={spent} prev={prev} lowerIsBetter />}
+                  </span>
+                </div>
+                {monthly > 0 && pct !== null && (
+                  <div style={{ height: 4, borderRadius: 2, background: "#E3DDC9", marginBottom: 6 }}>
+                    <div style={{ height: "100%", borderRadius: 2, width: `${pct}%`, background: over ? "#8A3C28" : cc.bar }} />
+                  </div>
+                )}
+                {tags.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {tags.map(([tag, amt]) => (
+                      <span key={tag} style={{ fontSize: 11.5, background: cc.bg, color: cc.text, padding: "2px 8px", borderRadius: 20 }}>
+                        {tag} {fmt(amt)}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Other spending */}
+          <div style={{ padding: "10px 0", borderBottom: "1px solid #E3DDC9" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+              <span style={{ fontSize: 13.5, fontWeight: 500, color: CATEGORY_COLORS.other.text }}>Other</span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, color: "#1C2B3A" }}>
+                {fmt(otherSpend)}
+                {hasPrev && <DeltaPill curr={otherSpend} prev={prevOtherSpend} lowerIsBetter />}
+              </span>
+            </div>
+            {catTags("other", spending).length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {catTags("other", spending).map(([tag, amt]) => (
+                  <span key={tag} style={{ fontSize: 11.5, background: CATEGORY_COLORS.other.bg, color: CATEGORY_COLORS.other.text, padding: "2px 8px", borderRadius: 20 }}>
+                    {tag} {fmt(amt)}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Total row */}
+          <div style={{ padding: "12px 0 4px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+              <span style={{ fontSize: 13.5, fontWeight: 500, color: "#1C2B3A" }}>Total spending</span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 15, fontWeight: 500 }}>
+                {fmt(totalSpend)}
+                {hasPrev && <DeltaPill curr={totalSpend} prev={prevTotalSpend} lowerIsBetter />}
+              </span>
+            </div>
+          </div>
+        </Ledger>
+        {spending.length === 0 && (
+          <div style={{ fontSize: 13, color: "#8B96A3", marginTop: 8 }}>No spending logged for this month.</div>
+        )}
+      </Card>
+
+      {/* ── Bills ── */}
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Bills paid this month</div>
+        {billHistory.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8B96A3" }}>No bills marked as paid this month.</div>
+        ) : (
+          <Ledger>
+            {billHistory.map((h) => (
+              <LedgerRow
+                key={h.id}
+                label={h.billName}
+                sub={h.paidDate ? `Paid ${formatLocalDate(h.paidDate)}` : ""}
+                amount={h.amount}
+              />
+            ))}
+            <LedgerRow
+              label="Total"
+              amount={billsPaidTotal}
+            />
+          </Ledger>
+        )}
+      </Card>
+
+      {/* ── Bailouts ── */}
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Bailout transfers</div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 12 }}>
+          {bailouts.length} transfer{bailouts.length === 1 ? "" : "s"} · {fmt(totalBailouts)} total
+          {hasPrev && <DeltaPill curr={totalBailouts} prev={prevTotalBailouts} lowerIsBetter />}
+        </div>
+        {bailouts.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#3B5C40", fontWeight: 500 }}>
+            No bailout transfers this month
+          </div>
+        ) : (
+          <Ledger>
+            {bailouts.map((b) => (
+              <LedgerRow
+                key={b.id}
+                label={`${ACCOUNT_DISPLAY_NAMES[b.fromBucket] || b.fromBucket} → ${ACCOUNT_DISPLAY_NAMES[b.toBucket] || b.toBucket}`}
+                sub={b.reason || "No reason logged"}
+                amount={b.amount}
+                accent="#8A3C28"
+              />
+            ))}
+          </Ledger>
+        )}
+      </Card>
+
+      {/* ── Net summary ── */}
+      <Card>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 12 }}>Net summary</div>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(3, 1fr)", gap: 12 }}>
+          {[
+            { label: "Income", value: totalIncome, tone: "good" },
+            { label: "Spending", value: totalSpend, tone: "warn" },
+            { label: "Net", value: round2(totalIncome - totalSpend), tone: totalIncome >= totalSpend ? "good" : "warn" },
+          ].map(({ label, value, tone }) => (
+            <div key={label} style={{
+              background: tone === "good" ? "#E4ECE4" : tone === "warn" ? "#F3E3DC" : "#EDE9DC",
+              borderRadius: 6, padding: "12px 14px",
+            }}>
+              <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>{label}</div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, fontWeight: 500, color: tone === "good" ? "#3B5C40" : "#8A3C28" }}>
+                {fmt(value)}
+              </div>
+            </div>
+          ))}
+        </div>
       </Card>
     </div>
   );
 }
 
 /* ---------- Alerts View ---------- */
-function AlertsView({ state, update }) {
+function AlertsView({ state, update, setView }) {
   const pace = checkPaceAlert(state);
   const [customLabel, setCustomLabel] = useState("");
   const [expandedRequests, setExpandedRequests] = useState({}); // { [limId]: boolean }
   const [importError, setImportError] = useState("");
   const [importedOk, setImportedOk] = useState(false);
+  const [resetConfirming, setResetConfirming] = useState(false);
+
+  function resetAllData() {
+    update(initialState);
+    setResetConfirming(false);
+    if (setView) setView("setup");
+  }
 
   function exportData() {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
@@ -2921,6 +3796,54 @@ function AlertsView({ state, update }) {
       <SectionTitle eyebrow="Stay ahead of trouble">Alerts</SectionTitle>
 
       <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Leftover split</div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14, maxWidth: 460 }}>
+          After bills and budget allocations, how leftover income divides between your spending
+          money, goals, and sinking fund. Must add up to 100%.
+        </div>
+        {(() => {
+          const sp = state.leftoverSplit || { slush: 50, stss: 50, sinkingFund: 0 };
+          const total = (sp.slush || 0) + (sp.stss || 0) + (sp.sinkingFund || 0);
+          const valid = total === 100;
+          return (
+            <div>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+                {[
+                  { key: "slush", label: "Slush fund" },
+                  { key: "stss", label: "STSS (goals)" },
+                  { key: "sinkingFund", label: "Sinking fund" },
+                ].map(({ key, label }) => (
+                  <div key={key} style={{ minWidth: 120 }}>
+                    <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>{label}</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <Input
+                        type="number"
+                        min="0"
+                        max="100"
+                        value={sp[key] || 0}
+                        onChange={(e) => {
+                          const val = Math.max(0, Math.min(100, parseInt(e.target.value) || 0));
+                          update((s) => ({
+                            ...s,
+                            leftoverSplit: { ...(s.leftoverSplit || { slush: 50, stss: 50, sinkingFund: 0 }), [key]: val },
+                          }));
+                        }}
+                        style={{ width: 70 }}
+                      />
+                      <span style={{ fontSize: 13, color: "#8B96A3" }}>%</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 12.5, color: valid ? "#3B5C40" : "#8A3C28", fontWeight: 500 }}>
+                Total: {total}% {valid ? "✓" : "— must equal 100%"}
+              </div>
+            </div>
+          );
+        })()}
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
         <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Move data between devices</div>
         <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14, maxWidth: 460 }}>
           Download everything in this app as a single file, then import that same file on another
@@ -2954,6 +3877,34 @@ function AlertsView({ state, update }) {
         {importedOk && (
           <div style={{ fontSize: 12.5, color: "#3B5C40", marginTop: 10 }}>
             Imported successfully — your data here now matches the file.
+          </div>
+        )}
+      </Card>
+
+      <Card style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 500, fontSize: 14.5, marginBottom: 4 }}>Reset all data</div>
+        <div style={{ fontSize: 12.5, color: "#8B96A3", marginBottom: 14, maxWidth: 460 }}>
+          Clears every bill, paycheck, invoice, spending entry, bailout, goal, and balance — back
+          to a completely blank app, as if freshly installed. This cannot be undone, so export a
+          backup first if there's any chance you'll want this data later.
+        </div>
+        {!resetConfirming ? (
+          <Button variant="subtle" onClick={() => setResetConfirming(true)}>
+            Reset all data
+          </Button>
+        ) : (
+          <div style={{ background: "#F3E3DC", border: "1px solid #D9A98D", borderRadius: 8, padding: "12px 14px" }}>
+            <div style={{ fontSize: 13, color: "#8A3C28", fontWeight: 500, marginBottom: 10 }}>
+              Are you sure? Everything will be erased and you'll be taken back to Setup.
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <Button onClick={resetAllData} style={{ background: "#8A3C28" }}>
+                Yes, erase everything
+              </Button>
+              <Button variant="ghost" onClick={() => setResetConfirming(false)}>
+                Cancel
+              </Button>
+            </div>
           </div>
         )}
       </Card>
@@ -3272,6 +4223,7 @@ const SETUP_STEPS = [
   { id: "bills", title: "Bills this month" },
   { id: "spending", title: "Additional spending" },
   { id: "balances", title: "Current account balances" },
+  { id: "leftoversplit", title: "Leftover split" },
   { id: "moneydate", title: "Weekly money date" },
 ];
 
@@ -3367,7 +4319,7 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
           description: inv.description,
           amount,
           issueDate: inv.issueDate,
-          status: "unpaid",
+          status: inv.status === "pending" ? "pending" : "unpaid",
           paidDate: null,
           incomeId: null,
         };
@@ -3377,14 +4329,18 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
         }
       });
 
-      // 3. bills — mark drafted ones paid for this month, same as the checkbox elsewhere
+      // 3. bills — drafted ones marked "already paid" go straight to Paid
+      // (advance twice: Unpaid -> Pending -> Paid), same end state as checking
+      // the box twice elsewhere in the app
       Object.keys(draftBillsPaid).forEach((billId) => {
         if (draftBillsPaid[billId]) {
-          working = markBillPaid(working, billId);
+          working = advanceBillStatus(working, billId);
+          working = advanceBillStatus(working, billId);
         }
       });
 
-      // 4. additional category spending
+      // 4. additional category spending — backfilled history, so default to
+      // settled status since these already happened
       const newSpending = [...working.spending];
       draftSpending.forEach((sp) => {
         const amount = round2(parseFloat(sp.amount) || 0);
@@ -3397,6 +4353,7 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
           date: sp.date,
           monthKey: monthKey(parseLocalDate(sp.date)),
           tags: parseTags(sp.tags),
+          status: STATUS.PAID,
         });
       });
       working = { ...working, spending: newSpending };
@@ -3405,7 +4362,7 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
       const split = computeMonthlySplit(working, mKey);
       working = {
         ...working,
-        buckets: { ...working.buckets, slush: split.slushAdd, stss: split.stssAdd },
+        buckets: { ...working.buckets, slush: split.slushAdd, stss: split.stssAdd, sinkingFund: split.sinkingFundAdd },
       };
 
       // 5. final step: actual balances overwrite whatever the simulation produced —
@@ -3420,10 +4377,9 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
           tax: round2(parseFloat(balances.tax) || 0),
           slush: round2(parseFloat(balances.slush) || 0),
           stss: round2(parseFloat(balances.stss) || 0),
+          sinkingFund: round2(parseFloat(balances.sinkingFund) || 0),
         },
         setupCompleted: true,
-        // clear the draft now that it's been committed, so a future re-entry into
-        // Setup (via the nav) starts fresh rather than replaying old history
         setupDraft: initialState.setupDraft,
       };
 
@@ -3501,8 +4457,8 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
       {step === 5 && (
         <Card>
           <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 14 }}>
-            Last step — enter your real current balances. These overwrite anything the history
-            above would otherwise add up to, since your actual bank balance is what matters.
+            Enter your real current balances. These overwrite anything the history above would
+            otherwise add up to, since your actual bank balance is always ground truth.
           </div>
           <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(3, 1fr)", gap: 14 }}>
             {[
@@ -3512,6 +4468,7 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
               { key: "tax", label: "Taxes" },
               { key: "slush", label: "Slush fund" },
               { key: "stss", label: "STSS (goals)" },
+              { key: "sinkingFund", label: "Sinking fund" },
             ].map((f) => (
               <div key={f.key}>
                 <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 4 }}>{f.label}</div>
@@ -3532,6 +4489,57 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
       {step === 6 && (
         <Card>
           <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 14 }}>
+            After bills and spending budgets, how should leftover income split between your free
+            spending money, goals fund, and sinking fund for irregular expenses? Percentages must
+            add up to 100. You can adjust this any time from the Alerts tab.
+          </div>
+          {(() => {
+            const sp = state.leftoverSplit || { slush: 50, stss: 50, sinkingFund: 0 };
+            const total = (sp.slush || 0) + (sp.stss || 0) + (sp.sinkingFund || 0);
+            const valid = total === 100;
+            return (
+              <div>
+                <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 12 }}>
+                  {[
+                    { key: "slush", label: "Slush fund", desc: "Free spending — household, clothes, fun" },
+                    { key: "stss", label: "STSS (goals)", desc: "Funds your active savings goals weekly" },
+                    { key: "sinkingFund", label: "Sinking fund", desc: "Reserves for irregular one-time expenses" },
+                  ].map(({ key, label, desc }) => (
+                    <div key={key} style={{ flex: 1, minWidth: 140 }}>
+                      <div style={{ fontSize: 13.5, fontWeight: 500, color: "#1C2B3A", marginBottom: 2 }}>{label}</div>
+                      <div style={{ fontSize: 12, color: "#8B96A3", marginBottom: 8 }}>{desc}</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <Input
+                          type="number"
+                          min="0"
+                          max="100"
+                          value={sp[key] || 0}
+                          onChange={(e) => {
+                            const val = Math.max(0, Math.min(100, parseInt(e.target.value) || 0));
+                            update((s) => ({
+                              ...s,
+                              leftoverSplit: { ...(s.leftoverSplit || { slush: 50, stss: 50, sinkingFund: 0 }), [key]: val },
+                            }));
+                          }}
+                          style={{ width: 70 }}
+                        />
+                        <span style={{ fontSize: 13, color: "#8B96A3" }}>%</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 500, color: valid ? "#3B5C40" : "#8A3C28", padding: "8px 12px", borderRadius: 6, background: valid ? "#E4ECE4" : "#F3E3DC" }}>
+                  Total: {total}% {valid ? "✓ Good to go" : "— needs to equal 100% before you can continue"}
+                </div>
+              </div>
+            );
+          })()}
+        </Card>
+      )}
+
+      {step === 7 && (
+        <Card>
+          <div style={{ fontSize: 13, color: "#8B96A3", marginBottom: 14 }}>
             A recurring weekly time to check in on your finances together. You'll get a heads-up
             banner in the app 30 minutes before. You can change this any time from the Alerts tab.
           </div>
@@ -3544,7 +4552,17 @@ function SetupWizard({ state, update, isMobile, onFinish }) {
           Back
         </Button>
         {step < SETUP_STEPS.length - 1 ? (
-          <Button onClick={goNext}>Next</Button>
+          (() => {
+            const sp = state.leftoverSplit || { slush: 50, stss: 50, sinkingFund: 0 };
+            const splitTotal = (sp.slush || 0) + (sp.stss || 0) + (sp.sinkingFund || 0);
+            const blocked = step === 6 && splitTotal !== 100;
+            return (
+              <Button onClick={goNext} style={blocked ? { opacity: 0.4, cursor: "not-allowed" } : {}}
+                {...(blocked ? { onClick: undefined } : {})}>
+                Next
+              </Button>
+            );
+          })()
         ) : (
           <Button onClick={commitSetup}>Finish setup</Button>
         )}
@@ -3593,7 +4611,7 @@ function PaycheckDraftStep({ drafts, setDrafts }) {
           onChange={(e) => setType(e.target.value)}
           style={{ fontFamily: "Inter, sans-serif", fontSize: 14, padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A" }}
         >
-          <option value="regular">Regular</option>
+          <option value="regular">W-2</option>
           <option value="freelance">Freelance</option>
         </select>
         <Button variant="subtle" onClick={add}>Add</Button>
@@ -3605,7 +4623,7 @@ function PaycheckDraftStep({ drafts, setDrafts }) {
           {drafts.map((d) => (
             <LedgerRow
               key={d.id}
-              label={d.type === "freelance" ? "Freelance income" : "Regular income"}
+              label={d.type === "freelance" ? "Freelance income" : "W-2 income"}
               sub={formatLocalDate(d.date)}
               amount={parseFloat(d.amount) || 0}
               right={
@@ -3654,6 +4672,7 @@ function InvoiceDraftStep({ drafts, setDrafts }) {
           style={{ fontFamily: "Inter, sans-serif", fontSize: 14, padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D2C2", background: "#FFFEFB", color: "#1C2B3A" }}
         >
           <option value="unpaid">Unpaid</option>
+          <option value="pending">Pending (payment in motion)</option>
           <option value="paid">Already paid</option>
         </select>
         <Button variant="subtle" onClick={add}>Add</Button>
@@ -3692,7 +4711,7 @@ function BillsDraftStep({ bills, draftPaid, setDraftPaid }) {
           <LedgerRow
             key={b.id}
             label={b.name}
-            sub={`Due on the ${ordinal(b.day)}`}
+            sub={billDueSub(b)}
             amount={b.amount}
             right={
               <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#1C2B3A", cursor: "pointer" }}>
